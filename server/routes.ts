@@ -1,0 +1,925 @@
+import type { Express, Request, Response } from "express";
+import type { Server } from "node:http";
+import { storage } from "./storage";
+import {
+  config,
+  supabaseConfigured,
+  encryptionConfigured,
+  outlookConfigured,
+  gmailConfigured,
+} from "./config";
+import { supabase } from "./supabase";
+import { encrypt } from "./crypto";
+import { insertImapAccountSchema, updateAccountFiltersSchema, insertDatovkaMailboxSchema } from "@shared/schema";
+import multer from "multer";
+import { parseZfo } from "./datovka/zfo-parser";
+import { extractAttachmentText } from "./datovka/extract";
+import { classifyDatovkaMessage } from "./datovka/ai";
+import { testImapConnection, syncImapAccount, classifyThreadAsync } from "./connectors/imap";
+import {
+  buildOutlookAuthUrl,
+  exchangeOutlookCode,
+  syncOutlookAccount,
+  outlookSendMail,
+} from "./connectors/outlook";
+import {
+  buildGmailAuthUrl,
+  exchangeGmailCode,
+  syncGmailAccount,
+  gmailSendMail,
+} from "./connectors/gmail";
+import { sendViaSmtp } from "./connectors/smtp";
+import { aiConfigured, draftReply, documentQA, getAIConfigInfo } from "./ai";
+import { BUILTIN_COMMUNICATION_TEMPLATES, communicationGenerateSchema, generateCommunication } from "./communicator";
+import { anthropicConfigured, openaiConfigured, perplexityConfigured, geminiConfigured } from "./config";
+
+export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
+  // ---------- Health / config status ----------
+  app.get("/api/status", (_req, res) => {
+    res.json({
+      ok: true,
+      supabase: supabaseConfigured(),
+      encryption: encryptionConfigured(),
+      outlook: outlookConfigured(),
+      gmail: gmailConfigured(),
+      ai: aiConfigured(),
+      gemini: geminiConfigured(),
+      anthropic: anthropicConfigured(),
+      openai: openaiConfigured(),
+      perplexity: perplexityConfigured(),
+      user_id: config.userId,
+      bucket: config.supabase.bucket,
+    });
+  });
+
+  // ---------- AI konfigurace ----------
+  app.get("/api/ai/config", (_req, res) => {
+    res.json(getAIConfigInfo());
+  });
+
+  // ---------- Accounts ----------
+  app.get("/api/accounts", asyncH(async (_req, res) => {
+    res.json(await storage.listAccounts());
+  }));
+
+  app.post("/api/accounts", asyncH(async (req, res) => {
+    requireEnc();
+    requireSupabase();
+    const data = insertImapAccountSchema.parse(req.body);
+    // test connection first
+    try {
+      await testImapConnection({
+        host: data.imap_host,
+        port: data.imap_port,
+        email: data.email,
+        password: data.imap_password,
+        useTls: data.imap_use_tls,
+      });
+    } catch (e: any) {
+      return res.status(400).json({ message: `IMAP přihlášení selhalo: ${e?.message || e}` });
+    }
+    const account = await storage.createAccount({
+      name: data.name,
+      provider: "imap",
+      email: data.email,
+      imap_host: data.imap_host,
+      imap_port: data.imap_port,
+      imap_password_enc: encrypt(data.imap_password),
+      imap_use_tls: data.imap_use_tls,
+      smtp_host: data.smtp_host || null,
+      smtp_port: data.smtp_port || null,
+      smtp_password_enc: data.smtp_password ? encrypt(data.smtp_password) : null,
+      sync_since_date: data.sync_since_date || null,
+      excluded_addresses: data.excluded_addresses || [],
+      excluded_subjects: data.excluded_subjects || [],
+    });
+    res.json(account);
+  }));
+
+  app.patch("/api/accounts/:id", asyncH(async (req, res) => {
+    requireSupabase();
+    const id = String(req.params.id);
+    const account = await storage.getAccount(id);
+    if (!account) return res.status(404).json({ message: "Účet nenalezen" });
+    const data = updateAccountFiltersSchema.parse(req.body);
+    const patch: Record<string, any> = {};
+    if (data.name !== undefined) patch.name = data.name;
+    if (data.sync_since_date !== undefined) patch.sync_since_date = data.sync_since_date ?? null;
+    if (data.excluded_addresses !== undefined) patch.excluded_addresses = data.excluded_addresses;
+    if (data.excluded_subjects !== undefined) patch.excluded_subjects = data.excluded_subjects;
+    await storage.updateAccount(id, patch);
+    const updated = await storage.getAccount(id);
+    res.json(updated);
+  }));
+
+  app.delete("/api/accounts/:id", asyncH(async (req, res) => {
+    await storage.deleteAccount(String(req.params.id));
+    res.json({ ok: true });
+  }));
+
+  // Počty zpráv podle kategorií pro danou schránku
+  app.get("/api/accounts/:id/category-counts", asyncH(async (req, res) => {
+    requireSupabase();
+    const accountId = String(req.params.id);
+    const counts = await storage.categoryCountsForAccount(accountId);
+    res.json(counts);
+  }));
+
+  // ---------- OAuth: Outlook ----------
+  app.get("/api/auth/outlook/start", (req, res) => {
+    if (!outlookConfigured()) return res.status(503).send("Outlook OAuth není nakonfigurováno (MS_CLIENT_ID/MS_CLIENT_SECRET).");
+    const state = Math.random().toString(36).slice(2);
+    res.redirect(buildOutlookAuthUrl(state));
+  });
+
+  app.get("/api/auth/outlook/callback", asyncH(async (req, res) => {
+    if (!outlookConfigured()) return res.status(503).send("Outlook OAuth není nakonfigurováno.");
+    requireSupabase();
+    requireEnc();
+    const code = String(req.query.code || "");
+    if (!code) return res.status(400).send("Chybí code.");
+    const { access_token, refresh_token, expires_in, account } = await exchangeOutlookCode(code);
+    await storage.createAccount({
+      name: account.name || account.email,
+      provider: "outlook",
+      email: account.email,
+      oauth_access_token_enc: encrypt(access_token),
+      oauth_refresh_token_enc: encrypt(refresh_token),
+      oauth_expires_at: new Date(Date.now() + expires_in * 1000).toISOString(),
+    });
+    res.redirect("/#/accounts");
+  }));
+
+  // ---------- OAuth: Gmail ----------
+  app.get("/api/auth/gmail/start", (req, res) => {
+    if (!gmailConfigured()) return res.status(503).send("Gmail OAuth není nakonfigurováno (GMAIL_CLIENT_ID/GMAIL_CLIENT_SECRET).");
+    const state = Math.random().toString(36).slice(2);
+    res.redirect(buildGmailAuthUrl(state));
+  });
+
+  app.get("/api/auth/gmail/callback", asyncH(async (req, res) => {
+    if (!gmailConfigured()) return res.status(503).send("Gmail OAuth není nakonfigurováno.");
+    requireSupabase();
+    requireEnc();
+    const code = String(req.query.code || "");
+    if (!code) return res.status(400).send("Chybí code.");
+    const { access_token, refresh_token, expires_in, account } = await exchangeGmailCode(code);
+    await storage.createAccount({
+      name: account.name || account.email,
+      provider: "gmail",
+      email: account.email,
+      oauth_access_token_enc: encrypt(access_token),
+      oauth_refresh_token_enc: encrypt(refresh_token),
+      oauth_expires_at: new Date(Date.now() + expires_in * 1000).toISOString(),
+    });
+    res.redirect("/#/accounts");
+  }));
+
+  // ---------- Sync ----------
+  app.post("/api/accounts/:id/sync", asyncH(async (req, res) => {
+    requireSupabase();
+    const account = await storage.getAccount(String(req.params.id));
+    if (!account) return res.status(404).json({ message: "Účet nenalezen" });
+    await storage.updateAccount(account.id, { sync_status: "syncing", sync_error: null });
+    res.json({ ok: true, status: "syncing" });
+    // run sync in background
+    (async () => {
+      try {
+        let result: { fetched: number } = { fetched: 0 };
+        if (account.provider === "imap") result = await syncImapAccount(account);
+        else if (account.provider === "outlook") result = await syncOutlookAccount(account);
+        else if (account.provider === "gmail") result = await syncGmailAccount(account);
+        await storage.updateAccount(account.id, {
+          sync_status: "idle",
+          sync_error: null,
+          last_sync_at: new Date().toISOString(),
+        });
+        console.log(`sync done for ${account.email}: ${result.fetched} new`);
+      } catch (e: any) {
+        console.error("sync error", e?.message || e);
+        await storage.updateAccount(account.id, {
+          sync_status: "error",
+          sync_error: String(e?.message || e),
+        });
+      }
+    })();
+  }));
+
+  app.get("/api/accounts/:id/sync/status", asyncH(async (req, res) => {
+    const account = await storage.getAccount(String(req.params.id));
+    if (!account) return res.status(404).json({ message: "Účet nenalezen" });
+    res.json({
+      status: account.sync_status,
+      error: account.sync_error,
+      last_sync_at: account.last_sync_at,
+    });
+  }));
+
+  // ---------- Threads ----------
+  app.get("/api/threads", asyncH(async (req, res) => {
+    const threads = await storage.listThreads({
+      accountId: req.query.account_id as string | undefined,
+      category: req.query.category as string | undefined,
+      q: req.query.q as string | undefined,
+      unread: req.query.unread === "1" || req.query.unread === "true",
+      highPriority: req.query.priority === "high",
+      withAttachments: req.query.attachments === "1",
+      archived: req.query.archived === "1" ? true : req.query.archived === "0" ? false : undefined,
+    });
+    res.json(threads);
+  }));
+
+  app.get("/api/threads/:id", asyncH(async (req, res) => {
+    const thread = await storage.getThread(String(req.params.id));
+    if (!thread) return res.status(404).json({ message: "Vlákno nenalezeno" });
+    const [messages, attachments, account, actions] = await Promise.all([
+      storage.getMessagesByThread(thread.id),
+      storage.getAttachmentsByThread(thread.id),
+      thread.account_id ? storage.getAccount(thread.account_id) : null,
+      storage.listActionsByThread(thread.id),
+    ]);
+    res.json({ ...thread, messages, attachments, account, actions });
+  }));
+
+  app.patch("/api/threads/:id", asyncH(async (req, res) => {
+    const allowed: any = {};
+    if (typeof req.body.is_read === "boolean") allowed.is_read = req.body.is_read;
+    if (typeof req.body.is_archived === "boolean") allowed.is_archived = req.body.is_archived;
+    await storage.updateThread(String(req.params.id), allowed);
+    res.json({ ok: true });
+  }));
+
+  app.post("/api/threads/:id/resummarize", asyncH(async (req, res) => {
+    classifyThreadAsync(String(req.params.id), req.body?.provider, req.body?.model).catch((e) => console.error(e));
+    res.json({ ok: true, status: "queued" });
+  }));
+
+  // ---------- Drafts / replies ----------
+  app.post("/api/threads/:id/draft-reply", asyncH(async (req, res) => {
+    const thread = await storage.getThread(String(req.params.id));
+    if (!thread) return res.status(404).json({ message: "Vlákno nenalezeno" });
+    const messages = await storage.getMessagesByThread(thread.id);
+    const attachments = await storage.getAttachmentsByThread(thread.id);
+    const threadText = messages
+      .slice(-20)
+      .map((m) => `--- ${m.from_address}: ${m.sent_at} ---\n${(m.body_text || "").slice(0, 4000)}`)
+      .join("\n\n");
+    const attachmentsText = attachments
+      .map((a) => `* ${a.filename}\n${(a.extracted_text || "").slice(0, 5000)}`)
+      .join("\n\n");
+    const result = await draftReply({
+      language: thread.language || "cs",
+      threadText,
+      attachmentsText,
+      instructions: req.body?.instructions,
+      tone: req.body?.tone,
+      provider: req.body?.provider,
+      model: req.body?.model,
+    });
+    const action = await storage.insertAction({
+      thread_id: thread.id,
+      type: "reply_draft",
+      prompt: req.body?.instructions || "",
+      result,
+      language: thread.language || "cs",
+      status: "draft",
+    });
+    res.json(action);
+  }));
+
+  app.post("/api/threads/:id/send", asyncH(async (req, res) => {
+    const thread = await storage.getThread(String(req.params.id));
+    if (!thread) return res.status(404).json({ message: "Vlákno nenalezeno" });
+    const account = await storage.getAccount(thread.account_id);
+    if (!account) return res.status(404).json({ message: "Účet nenalezen" });
+    const messages = await storage.getMessagesByThread(thread.id);
+    const last = messages[messages.length - 1];
+    const to: string[] = req.body?.to && Array.isArray(req.body.to)
+      ? req.body.to
+      : last?.from_address
+        ? [last.from_address]
+        : [];
+    if (!to.length) return res.status(400).json({ message: "Chybí příjemce." });
+    const subject = req.body?.subject || (thread.subject?.startsWith("Re:") ? thread.subject : `Re: ${thread.subject || ""}`);
+    const body = req.body?.body || "";
+    if (!body) return res.status(400).json({ message: "Prázdný text odpovědi." });
+
+    if (account.provider === "imap") await sendViaSmtp(account, to, subject, body);
+    else if (account.provider === "outlook") await outlookSendMail(account, to, subject, body);
+    else if (account.provider === "gmail") await gmailSendMail(account, to, subject, body);
+
+    // record outgoing message
+    await storage.insertMessage({
+      thread_id: thread.id,
+      account_id: account.id,
+      external_id: `out:${Date.now()}`,
+      from_address: account.email,
+      to_addresses: to,
+      subject,
+      body_text: body,
+      sent_at: new Date().toISOString(),
+      is_outgoing: true,
+    });
+    res.json({ ok: true });
+  }));
+
+  // ---------- Attachments ----------
+  app.get("/api/attachments/:id/download", asyncH(async (req, res) => {
+    const att = await storage.getAttachment(String(req.params.id));
+    if (!att || !att.storage_path) return res.status(404).json({ message: "Příloha nenalezena" });
+    const s = supabase();
+    if (!s) return res.status(503).json({ message: "Supabase neni nakonfigurovano" });
+    const { data, error } = await s.storage.from(config.supabase.bucket).createSignedUrl(att.storage_path, 300);
+    if (error) return res.status(500).json({ message: error.message });
+    res.json({ url: data.signedUrl, filename: att.filename });
+  }));
+
+  app.get("/api/attachments/:id/preview", asyncH(async (req, res) => {
+    const att = await storage.getAttachment(String(req.params.id));
+    if (!att) return res.status(404).json({ message: "Příloha nenalezena" });
+    res.json({
+      id: att.id,
+      filename: att.filename,
+      mime_type: att.mime_type,
+      size_bytes: att.size_bytes,
+      extracted_text: att.extracted_text || "",
+      ocr_used: att.ocr_used,
+      thread_id: att.thread_id,
+    });
+  }));
+
+  app.post("/api/attachments/:id/qa", asyncH(async (req, res) => {
+    const att = await storage.getAttachment(String(req.params.id));
+    if (!att) return res.status(404).json({ message: "Příloha nenalezena" });
+    const question = String(req.body?.question || "").trim();
+    if (!question) return res.status(400).json({ message: "Chybí otázka." });
+    const answer = await documentQA(att.extracted_text || "", question, {
+      provider: req.body?.provider,
+      model: req.body?.model,
+    });
+    const action = await storage.insertAction({
+      thread_id: att.thread_id,
+      attachment_id: att.id,
+      type: "document_qa",
+      prompt: question,
+      result: answer,
+      status: "draft",
+    });
+    res.json(action);
+  }));
+
+  // ===== DATOVKA MODULE =====
+  const datovkaUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 50 * 1024 * 1024, files: 10 },
+  });
+
+  const DATOVKA_BUCKET = "datovka-files";
+
+  // GET /api/datovka/mailboxes
+  app.get("/api/datovka/mailboxes", asyncH(async (_req, res) => {
+    requireSupabase();
+    const sb = supabase()!;
+    const { data, error } = await sb
+      .from("datovka_mailboxes")
+      .select("*")
+      .eq("user_id", config.userId)
+      .order("created_at", { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  }));
+
+  // POST /api/datovka/mailboxes
+  app.post("/api/datovka/mailboxes", asyncH(async (req, res) => {
+    requireSupabase();
+    const parsed = insertDatovkaMailboxSchema.parse(req.body);
+    const sb = supabase()!;
+    const { data, error } = await sb
+      .from("datovka_mailboxes")
+      .insert({ ...parsed, user_id: config.userId })
+      .select()
+      .single();
+    if (error) throw error;
+    res.status(201).json(data);
+  }));
+
+  // PATCH /api/datovka/mailboxes/:id
+  app.patch("/api/datovka/mailboxes/:id", asyncH(async (req, res) => {
+    requireSupabase();
+    const sb = supabase()!;
+    const id = String(req.params.id);
+    const parsed = insertDatovkaMailboxSchema.partial().parse(req.body);
+    const { data, error } = await sb
+      .from("datovka_mailboxes")
+      .update(parsed)
+      .eq("id", id)
+      .eq("user_id", config.userId)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  }));
+
+  // DELETE /api/datovka/mailboxes/:id
+  app.delete("/api/datovka/mailboxes/:id", asyncH(async (req, res) => {
+    requireSupabase();
+    const sb = supabase()!;
+    const { error } = await sb
+      .from("datovka_mailboxes")
+      .delete()
+      .eq("id", String(req.params.id))
+      .eq("user_id", config.userId);
+    if (error) throw error;
+    res.json({ ok: true });
+  }));
+
+  // Mapování kategorie (UI slug) -> datovka submission_type hodnoty
+  const DATOVKA_CATEGORY_MAP: Record<string, string[]> = {
+    contract: [],
+    demand: ["demand"],
+    request: [],
+    invoice: ["invoice"],
+    client: [],
+    internal: [],
+    // "other" pokrývá všechny ostatní submission types + null
+    other: ["lawsuit", "ruling", "notice", "decision", "other"],
+  };
+  const DATOVKA_CATEGORY_KEYS = ["contract", "demand", "request", "invoice", "client", "internal", "other"] as const;
+
+  function datovkaCategoryOfMessage(submissionType: string | null | undefined): string {
+    if (!submissionType) return "other";
+    for (const k of DATOVKA_CATEGORY_KEYS) {
+      if (DATOVKA_CATEGORY_MAP[k].includes(submissionType)) return k;
+    }
+    return "other";
+  }
+
+  // GET /api/datovka/messages
+  app.get("/api/datovka/messages", asyncH(async (req, res) => {
+    requireSupabase();
+    const sb = supabase()!;
+    let q = sb
+      .from("datovka_messages")
+      .select("*")
+      .eq("user_id", config.userId)
+      .eq("is_archived", false)
+      .order("delivered_at", { ascending: false });
+
+    if (req.query.mailbox_id) q = q.eq("mailbox_id", String(req.query.mailbox_id));
+    if (req.query.institution) q = q.eq("institution_type", String(req.query.institution));
+    if (req.query.priority) q = q.eq("priority", String(req.query.priority));
+    if (req.query.from) q = q.gte("delivered_at", String(req.query.from));
+    if (req.query.to) q = q.lte("delivered_at", String(req.query.to));
+    if (req.query.q) {
+      const term = `%${req.query.q}%`;
+      q = q.or(`subject.ilike.${term},sender_name.ilike.${term},case_number.ilike.${term}`);
+    }
+
+    const { data, error } = await q;
+    if (error) throw error;
+    let rows = (data as any[]) || [];
+
+    // Filtr podle kategorie (UI slug) — mapuje na submission_type hodnoty
+    const category = typeof req.query.category === "string" ? req.query.category : "";
+    if (category && (DATOVKA_CATEGORY_KEYS as readonly string[]).includes(category)) {
+      rows = rows.filter((m) => datovkaCategoryOfMessage(m.submission_type) === category);
+    }
+
+    res.json(rows);
+  }));
+
+  // GET /api/datovka/mailboxes/:id/category-counts
+  // (special-case id="all" — všechny schránky uživatele)
+  app.get("/api/datovka/mailboxes/:id/category-counts", asyncH(async (req, res) => {
+    requireSupabase();
+    const sb = supabase()!;
+    const mailboxId = String(req.params.id);
+    let q = sb
+      .from("datovka_messages")
+      .select("submission_type, is_archived, mailbox_id")
+      .eq("user_id", config.userId)
+      .eq("is_archived", false);
+    if (mailboxId !== "all") q = q.eq("mailbox_id", mailboxId);
+    const { data, error } = await q;
+    if (error) throw error;
+    const rows = (data as any[]) || [];
+    const counts: Record<string, number> = { all: rows.length };
+    for (const k of DATOVKA_CATEGORY_KEYS) counts[k] = 0;
+    for (const r of rows) {
+      const k = datovkaCategoryOfMessage(r.submission_type);
+      counts[k] = (counts[k] || 0) + 1;
+    }
+    res.json(counts);
+  }));
+
+  // GET /api/datovka/messages/:id
+  app.get("/api/datovka/messages/:id", asyncH(async (req, res) => {
+    requireSupabase();
+    const sb = supabase()!;
+    const id = String(req.params.id);
+    const [msgRes, attRes] = await Promise.all([
+      sb.from("datovka_messages").select("*").eq("id", id).eq("user_id", config.userId).single(),
+      sb.from("datovka_attachments").select("*").eq("message_id", id).order("created_at"),
+    ]);
+    if (msgRes.error) return res.status(404).json({ message: "Zprava nenalezena" });
+    res.json({ ...msgRes.data, attachments: attRes.data || [] });
+  }));
+
+  // POST /api/datovka/messages/upload
+  app.post("/api/datovka/messages/upload", datovkaUpload.array("files", 10), asyncH(async (req, res) => {
+    requireSupabase();
+    const sb = supabase()!;
+    const files = req.files as Express.Multer.File[];
+    if (!files || files.length === 0) {
+      return res.status(400).json({ message: "Zadny soubor nebyl nahrán." });
+    }
+    const mailbox_id: string | null = req.body?.mailbox_id || null;
+    const processed: string[] = [];
+    const errors: Array<{ file: string; error: string }> = [];
+
+    for (const file of files) {
+      const filename = file.originalname;
+      const isZfo = filename.toLowerCase().endsWith(".zfo");
+      const isPdf = filename.toLowerCase().endsWith(".pdf");
+      const fileKind: "zfo" | "pdf" = isZfo ? "zfo" : "pdf";
+
+      try {
+        // 1) Upload original to storage
+        const storagePath = `${config.userId}/${Date.now()}_${filename}`;
+        const { error: uploadErr } = await sb.storage
+          .from(DATOVKA_BUCKET)
+          .upload(storagePath, file.buffer, {
+            contentType: file.mimetype || "application/octet-stream",
+            upsert: false,
+          });
+        if (uploadErr) throw new Error(`Storage upload failed: ${uploadErr.message}`);
+
+        // 2) Parse ZFO or treat as PDF
+        let meta: Record<string, string | undefined> = {};
+        let attachmentFiles: Array<{ filename: string; data: Buffer; mimeType?: string }> = [];
+
+        if (isZfo) {
+          const parsed = await parseZfo(file.buffer);
+          meta = parsed.metadata as Record<string, string | undefined>;
+          attachmentFiles = parsed.attachments;
+        } else {
+          // bare PDF
+          attachmentFiles = [{ filename, data: file.buffer, mimeType: "application/pdf" }];
+        }
+
+        // 3) Extract text from PDF attachments
+        let fullText = "";
+        const savedAttachments: Array<{ filename: string; storagePath: string; mimeType: string; sizeBytes: number; extractedText: string; ocrUsed: boolean }> = [];
+
+        for (const att of attachmentFiles) {
+          const { text, ocrUsed } = await extractAttachmentText(
+            att.filename,
+            att.mimeType || "application/octet-stream",
+            att.data
+          );
+          fullText += text + "\n";
+          const attStoragePath = `${config.userId}/att_${Date.now()}_${att.filename}`;
+          await sb.storage.from(DATOVKA_BUCKET).upload(attStoragePath, att.data, {
+            contentType: att.mimeType || "application/octet-stream",
+            upsert: false,
+          });
+          savedAttachments.push({
+            filename: att.filename,
+            storagePath: attStoragePath,
+            mimeType: att.mimeType || "application/octet-stream",
+            sizeBytes: att.data.length,
+            extractedText: text,
+            ocrUsed,
+          });
+        }
+
+        // 4) AI classification
+        const classification = await classifyDatovkaMessage({
+          subject: meta.subject || filename,
+          sender: meta.sender_name || "",
+          fullText: fullText.trim(),
+          deliveredAt: meta.delivered_at,
+        });
+
+        // 5) Insert message row
+        const { data: msg, error: msgErr } = await sb
+          .from("datovka_messages")
+          .insert({
+            user_id: config.userId,
+            mailbox_id: mailbox_id || null,
+            dm_id: meta.dm_id || null,
+            sender_name: meta.sender_name || null,
+            sender_id_ds: meta.sender_id_ds || null,
+            sender_ico: meta.sender_ico || null,
+            recipient_name: meta.recipient_name || null,
+            recipient_id_ds: meta.recipient_id_ds || null,
+            subject: meta.subject || filename,
+            delivered_at: meta.delivered_at || null,
+            accepted_at: meta.accepted_at || null,
+            institution_type: classification.institution_type,
+            submission_type: classification.submission_type,
+            case_number: classification.case_number,
+            priority: classification.priority,
+            summary: classification.summary,
+            key_facts: classification.key_facts,
+            deadline_date: classification.deadline_date,
+            deadline_text: classification.deadline_text,
+            content_preview: fullText.trim().slice(0, 500),
+            full_text: fullText.trim(),
+            original_filename: filename,
+            storage_path: storagePath,
+            file_kind: fileKind,
+            is_processed: true,
+          })
+          .select()
+          .single();
+        if (msgErr) throw new Error(`DB insert failed: ${msgErr.message}`);
+
+        // 6) Insert attachments
+        for (const att of savedAttachments) {
+          await sb.from("datovka_attachments").insert({
+            message_id: msg.id,
+            user_id: config.userId,
+            filename: att.filename,
+            mime_type: att.mimeType,
+            size_bytes: att.sizeBytes,
+            storage_path: att.storagePath,
+            extracted_text: att.extractedText,
+            ocr_used: att.ocrUsed,
+          });
+        }
+
+        processed.push(filename);
+      } catch (e: any) {
+        console.error(`[datovka/upload] Error processing ${filename}:`, e?.message);
+        errors.push({ file: filename, error: e?.message || String(e) });
+        // Still try to save a record with error state
+        try {
+          const sb2 = supabase()!;
+          await sb2.from("datovka_messages").insert({
+            user_id: config.userId,
+            mailbox_id: mailbox_id || null,
+            subject: filename,
+            original_filename: filename,
+            file_kind: filename.toLowerCase().endsWith(".zfo") ? "zfo" : "pdf",
+            is_processed: false,
+            processing_error: e?.message || String(e),
+          });
+        } catch (_) { /* ignore */ }
+      }
+    }
+
+    res.json({ processed: processed.length, files: processed, errors });
+  }));
+
+  // PATCH /api/datovka/messages/:id
+  app.patch("/api/datovka/messages/:id", asyncH(async (req, res) => {
+    requireSupabase();
+    const sb = supabase()!;
+    const allowed = [
+      "is_archived", "priority", "institution_type", "submission_type",
+      "case_number", "deadline_date", "deadline_text", "summary",
+      "mailbox_id", "subject", "sender_name", "delivered_at",
+    ];
+    const patch: Record<string, any> = {};
+    for (const k of allowed) if (req.body[k] !== undefined) patch[k] = req.body[k];
+    const { data, error } = await sb
+      .from("datovka_messages")
+      .update(patch)
+      .eq("id", String(req.params.id))
+      .eq("user_id", config.userId)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  }));
+
+  // DELETE /api/datovka/messages/:id
+  app.delete("/api/datovka/messages/:id", asyncH(async (req, res) => {
+    requireSupabase();
+    const sb = supabase()!;
+    const { error } = await sb
+      .from("datovka_messages")
+      .delete()
+      .eq("id", String(req.params.id))
+      .eq("user_id", config.userId);
+    if (error) throw error;
+    res.json({ ok: true });
+  }));
+
+  // POST /api/datovka/messages/:id/reclassify
+  app.post("/api/datovka/messages/:id/reclassify", asyncH(async (req, res) => {
+    requireSupabase();
+    const sb = supabase()!;
+    const { data: msg, error: fetchErr } = await sb
+      .from("datovka_messages")
+      .select("*")
+      .eq("id", String(req.params.id))
+      .eq("user_id", config.userId)
+      .single();
+    if (fetchErr || !msg) return res.status(404).json({ message: "Zprava nenalezena" });
+
+    const classification = await classifyDatovkaMessage({
+      subject: msg.subject || msg.original_filename || "",
+      sender: msg.sender_name || "",
+      fullText: msg.full_text || msg.content_preview || "",
+      deliveredAt: msg.delivered_at,
+    });
+
+    const { data, error } = await sb
+      .from("datovka_messages")
+      .update({
+        institution_type: classification.institution_type,
+        submission_type: classification.submission_type,
+        case_number: classification.case_number,
+        priority: classification.priority,
+        summary: classification.summary,
+        key_facts: classification.key_facts,
+        deadline_date: classification.deadline_date,
+        deadline_text: classification.deadline_text,
+        processing_error: null,
+      })
+      .eq("id", msg.id)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  }));
+
+  // GET /api/datovka/messages/:id/download
+  app.get("/api/datovka/messages/:id/download", asyncH(async (req, res) => {
+    requireSupabase();
+    const sb = supabase()!;
+    const { data: msg, error } = await sb
+      .from("datovka_messages")
+      .select("storage_path, original_filename")
+      .eq("id", String(req.params.id))
+      .eq("user_id", config.userId)
+      .single();
+    if (error || !msg?.storage_path) return res.status(404).json({ message: "Soubor nenalezen" });
+    const { data: signed, error: signErr } = await sb.storage
+      .from(DATOVKA_BUCKET)
+      .createSignedUrl(msg.storage_path, 300);
+    if (signErr || !signed?.signedUrl) return res.status(500).json({ message: "Nelze vytvorit odkaz" });
+    res.json({ url: signed.signedUrl, filename: msg.original_filename });
+  }));
+
+  // GET /api/datovka/attachments/:id/download
+  app.get("/api/datovka/attachments/:id/download", asyncH(async (req, res) => {
+    requireSupabase();
+    const sb = supabase()!;
+    const { data: att, error } = await sb
+      .from("datovka_attachments")
+      .select("storage_path, filename")
+      .eq("id", String(req.params.id))
+      .eq("user_id", config.userId)
+      .single();
+    if (error || !att?.storage_path) return res.status(404).json({ message: "Priloha nenalezena" });
+    const { data: signed, error: signErr } = await sb.storage
+      .from(DATOVKA_BUCKET)
+      .createSignedUrl(att.storage_path, 300);
+    if (signErr || !signed?.signedUrl) return res.status(500).json({ message: "Nelze vytvorit odkaz" });
+    res.json({ url: signed.signedUrl, filename: att.filename });
+  }));
+
+
+  // ===== GOLD DESK COMMUNICATOR MODULE =====
+  app.get("/api/communicator/templates", asyncH(async (_req, res) => {
+    const sb = supabase();
+    if (!sb) return res.json(BUILTIN_COMMUNICATION_TEMPLATES);
+    const { data, error } = await sb
+      .from("communication_templates")
+      .select("*")
+      .eq("user_id", config.userId)
+      .eq("active", true)
+      .order("category", { ascending: true })
+      .order("name", { ascending: true });
+    if (error) {
+      // If the migration was not applied yet, keep the UI usable with built-ins.
+      return res.json(BUILTIN_COMMUNICATION_TEMPLATES);
+    }
+    res.json((data && data.length ? data : BUILTIN_COMMUNICATION_TEMPLATES));
+  }));
+
+  app.get("/api/communicator/history", asyncH(async (req, res) => {
+    const sb = supabase();
+    if (!sb) return res.json([]);
+    let q = sb
+      .from("communication_cases")
+      .select("*, communication_outputs(*)")
+      .eq("user_id", config.userId)
+      .order("created_at", { ascending: false })
+      .limit(100);
+    if (req.query.mode) q = q.eq("mode", String(req.query.mode));
+    if (req.query.risk_level) q = q.eq("risk_level", String(req.query.risk_level));
+    if (req.query.situation_type) q = q.eq("situation_type", String(req.query.situation_type));
+    const { data, error } = await q;
+    if (error) return res.json([]);
+    res.json(data || []);
+  }));
+
+  app.post("/api/communicator/generate", asyncH(async (req, res) => {
+    const parsed = communicationGenerateSchema.parse(req.body || {});
+    const result = await generateCommunication(parsed);
+    res.json(result);
+  }));
+
+  app.post("/api/communicator/risk-check", asyncH(async (req, res) => {
+    const parsed = communicationGenerateSchema.parse({ ...(req.body || {}), desired_output_types: { email: false, sms: false, whatsapp: false, phone_script: false, internal_note: true, html: false } });
+    const result = await generateCommunication(parsed);
+    res.json({
+      summary: result.summary,
+      risk_analysis: result.risk_analysis,
+      phrases_to_avoid: result.phrases_to_avoid,
+      safe_wording: result.safe_wording,
+      checklist: result.checklist,
+      recommended_next_steps: result.recommended_next_steps,
+      approval_required: result.approval_required,
+    });
+  }));
+
+  app.post("/api/communicator/save", asyncH(async (req, res) => {
+    requireSupabase();
+    const sb = supabase()!;
+    const parsed = communicationGenerateSchema.parse(req.body?.input || req.body || {});
+    const output = req.body?.output || null;
+    const { data: commCase, error: caseError } = await sb
+      .from("communication_cases")
+      .insert({
+        user_id: config.userId,
+        mode: parsed.mode,
+        client_name: parsed.client_name || null,
+        client_email: parsed.client_email || null,
+        product_type: parsed.product_type || null,
+        situation_type: parsed.situation_type || null,
+        risk_level: parsed.risk_level,
+        tone: parsed.tone || null,
+        input_data: parsed,
+        created_by: config.userId,
+      })
+      .select("*")
+      .single();
+    if (caseError) throw caseError;
+
+    const { data: commOutput, error: outputError } = await sb
+      .from("communication_outputs")
+      .insert({
+        user_id: config.userId,
+        case_id: commCase.id,
+        subject: output?.subject || null,
+        summary: output?.summary || null,
+        email_text: output?.email_text || null,
+        sms_text: output?.sms_text || null,
+        whatsapp_text: output?.whatsapp_text || null,
+        phone_script: output?.phone_script || null,
+        internal_note: output?.internal_note || null,
+        review_reply: output?.review_reply || null,
+        html_output: output?.html_output || null,
+        risk_analysis: output?.risk_analysis || {},
+        phrases_to_avoid: output?.phrases_to_avoid || [],
+        safe_wording: output?.safe_wording || [],
+        checklist: output?.checklist || [],
+        recommended_next_steps: output?.recommended_next_steps || [],
+        approval_required: !!output?.approval_required,
+        approved: false,
+      })
+      .select("*")
+      .single();
+    if (outputError) throw outputError;
+
+    await sb.from("communication_audit_log").insert({
+      user_id: config.userId,
+      case_id: commCase.id,
+      action: "communication_saved",
+      actor: config.userId,
+      payload: { mode: parsed.mode, situation_type: parsed.situation_type, risk_level: parsed.risk_level },
+    });
+
+    res.status(201).json({ case: commCase, output: commOutput });
+  }));
+
+  return httpServer;
+}
+
+// ----- helpers -----
+function asyncH(fn: (req: Request, res: Response) => Promise<any>) {
+  return (req: Request, res: Response, next: any) => {
+    fn(req, res).catch(next);
+  };
+}
+
+function requireSupabase() {
+  if (!supabaseConfigured()) {
+    const err: any = new Error("Supabase není nakonfigurováno. Doplňte SUPABASE_URL a SUPABASE_SERVICE_ROLE_KEY.");
+    err.status = 503;
+    throw err;
+  }
+}
+
+function requireEnc() {
+  if (!encryptionConfigured()) {
+    const err: any = new Error("MAILROOM_ENCRYPTION_KEY není nastaven (64 hex znaků).");
+    err.status = 503;
+    throw err;
+  }
+}
