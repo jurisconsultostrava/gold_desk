@@ -146,3 +146,23 @@ Potom otevři hlavní URL aplikace a nastav účty.
 - `SUPABASE_SERVICE_ROLE_KEY` má vysoká oprávnění. Railway projekt musí být chráněný a klíč nesmí být nikde ve veřejném repozitáři.
 - OAuth callback URL musí přesně odpovídat produkční Railway URL.
 - Datovka modul předpokládá nahrávání ZFO/PDF souborů, ne přímé napojení na ISDS API.
+
+## Poznámka k datové schránce
+
+Nová verze obsahuje PHP bridge pro ISDS (`dfridrich/czech-data-box`). Railway musí použít Dockerfile. V `railway.json` je nastaven builder `DOCKERFILE`.
+
+Po nasazení ověř:
+
+```text
+/api/status
+```
+
+V odpovědi má být `databox_bridge: true`.
+
+Pak v aplikaci otevři:
+
+```text
+/#/datovka
+```
+
+Klikni na `Schránky`, ulož přístupové údaje, proveď `Test` a následně `Sync`.

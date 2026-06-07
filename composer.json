@@ -1,0 +1,14 @@
+{
+  "name": "jurisconsult/golddesk-mailroom",
+  "description": "GoldDesk Mailroom PHP bridge for Czech Data Box / ISDS access.",
+  "type": "project",
+  "require": {
+    "php": ">=8.1",
+    "dfridrich/czech-data-box": "^1.4"
+  },
+  "config": {
+    "optimize-autoloader": true,
+    "preferred-install": "dist",
+    "sort-packages": true
+  }
+}

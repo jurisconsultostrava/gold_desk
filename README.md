@@ -364,3 +364,37 @@ Reklasifikaci lze spustit znovu přes menu **⋮ → Reklasifikovat** nebo v det
 ## GoldDesk Communicator
 
 Projekt je rozšířen o modul `/#/communicator`, který pomáhá s bezpečnou komunikací s klienty a reakcemi na recenze. Umí vygenerovat e-mail, SMS, WhatsApp text, telefonní skript, interní checklist, rizikovou kontrolu, HTML kód a veřejnou odpověď na recenzi. Detailní návod je v `COMMUNICATOR_README.md`.
+
+## Online přístup k datové schránce / ISDS
+
+Modul **Datovka** nyní podporuje také online synchronizaci přijatých datových zpráv přes PHP knihovnu `dfridrich/czech-data-box`.
+
+### Co je doplněno
+
+- `scripts/databox_bridge.php` – PHP bridge volaný z Node backendu.
+- `composer.json` – PHP závislost `dfridrich/czech-data-box`.
+- `server/datovka/live-client.ts` – server-side synchronizace ISDS.
+- UI v `/#/datovka → Schránky` – login, heslo, test přístupu, synchronizace.
+- Rozšíření `migration.sql` o šifrované přihlašovací údaje a sync metadata.
+
+### Důležité
+
+Railway musí použít Dockerfile, protože aplikace potřebuje zároveň Node.js i PHP SOAP runtime. `railway.json` je proto nastaven na builder `DOCKERFILE`.
+
+Přístupové údaje k ISDS jsou ukládány pouze v Supabase v šifrované podobě (`login_enc`, `password_enc`) přes `MAILROOM_ENCRYPTION_KEY`. Service role key ani hesla nesmí být ve frontendu ani v GitHubu.
+
+### Railway proměnné
+
+```env
+PHP_BINARY=php
+ISDS_CACHE_DIR=/tmp/GoldDeskDataBox
+DATABOX_BRIDGE_PATH=/app/scripts/databox_bridge.php
+```
+
+Tyto hodnoty už mají default v Dockerfile, ale můžeš je v Railway přepsat.
+
+## GoldDesk Communicator – PDF/HTML analýza dokumentů
+
+Modul `/communicator` nově podporuje nahrání PDF, HTML/HTM, TXT/MD souboru nebo vložení HTML/textu přímo do aplikace. Endpoint `/api/communicator/analyze-document` z dokumentu vytěží text, rozpozná typ komunikace, riziko, fakta, chybějící údaje a předvyplní formulář pro generování e-mailu, SMS, WhatsApp textu, telefonního skriptu, HTML kódu nebo reakce na recenzi.
+
+Detailní návod je v `COMMUNICATOR_DOCUMENT_IMPORT_README.md`.
