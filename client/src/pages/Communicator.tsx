@@ -1,6 +1,6 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { api, type CommunicatorInput, type CommunicatorOutput } from "@/lib/api";
+import { api, type CommunicatorDocumentAnalysis, type CommunicatorInput, type CommunicatorOutput } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -15,11 +15,14 @@ import {
   CheckCircle2,
   Code2,
   Copy,
+  FileSearch,
+  FileText,
   MessageSquareText,
   Phone,
   Save,
   ShieldAlert,
   Star,
+  Upload,
   Wand2,
 } from "lucide-react";
 
@@ -78,6 +81,10 @@ function initialForm(): CommunicatorInput {
     review_platform: "Google",
     review_rating: "",
     review_text: "",
+    source_document_name: "",
+    source_document_type: "",
+    source_document_summary: "",
+    source_document_text: "",
     what_happened: "",
     what_we_know: "",
     what_we_do_not_know: "",
@@ -104,6 +111,10 @@ export default function Communicator() {
   const [result, setResult] = useState<CommunicatorOutput | null>(null);
   const [htmlImport, setHtmlImport] = useState("");
   const [selectedReview, setSelectedReview] = useState<number | null>(null);
+  const [documentFile, setDocumentFile] = useState<File | null>(null);
+  const [documentInput, setDocumentInput] = useState("");
+  const [documentModeHint, setDocumentModeHint] = useState<"auto" | "client" | "review">("auto");
+  const [documentAnalysis, setDocumentAnalysis] = useState<CommunicatorDocumentAnalysis | null>(null);
 
   const templates = useQuery({
     queryKey: ["/api/communicator/templates"],
@@ -125,12 +136,57 @@ export default function Communicator() {
   });
 
   const save = useMutation({
-    mutationFn: () => api.communicatorSave(form, result || {}),
+    mutationFn: () => {
+      if (!result) throw new Error("Nejdřív vygenerujte výstup.");
+      return api.communicatorSave(form, result);
+    },
     onSuccess: () => {
       history.refetch();
       toast({ title: "Uloženo do historie" });
     },
     onError: (e: any) => toast({ title: "Uložení selhalo", description: e?.message || String(e), variant: "destructive" }),
+  });
+
+  const analyzeDocument = useMutation({
+    mutationFn: async (vars: { autoGenerate: boolean }) => {
+      if (!documentFile && !documentInput.trim()) {
+        throw new Error("Nahraj PDF/HTML/TXT soubor nebo vlož HTML/text dokumentu.");
+      }
+      const data = new FormData();
+      if (documentFile) data.append("file", documentFile);
+      if (documentInput.trim()) data.append("html_text", documentInput);
+      data.append("mode_hint", documentModeHint);
+      const analysis = await api.communicatorAnalyzeDocument(data);
+      return { analysis, autoGenerate: vars.autoGenerate };
+    },
+    onSuccess: async ({ analysis, autoGenerate }) => {
+      const patch = analysis.form_patch || {};
+      const nextForm: CommunicatorInput = {
+        ...form,
+        ...patch,
+        desired_output_types: {
+          ...form.desired_output_types,
+          ...patch.desired_output_types,
+        },
+      };
+      setForm(nextForm);
+      setDocumentAnalysis(analysis);
+      setResult(null);
+      toast({
+        title: "Dokument analyzován",
+        description: autoGenerate ? "Formulář je předvyplněn a generuji výstup." : "Formulář je předvyplněn z dokumentu.",
+      });
+      if (autoGenerate) {
+        try {
+          const generated = await api.communicatorGenerate(nextForm);
+          setResult(generated);
+          toast({ title: "Výstup vygenerován", description: generated.approval_required ? "Pozor: vyžaduje schválení." : "Text je připraven ke kontrole." });
+        } catch (e: any) {
+          toast({ title: "Generování po analýze selhalo", description: e?.message || String(e), variant: "destructive" });
+        }
+      }
+    },
+    onError: (e: any) => toast({ title: "Analýza dokumentu selhala", description: e?.message || String(e), variant: "destructive" }),
   });
 
   const extractedReviews = useMemo(() => extractReviewsFromHtml(htmlImport), [htmlImport]);
@@ -170,6 +226,12 @@ export default function Communicator() {
     }));
   }
 
+  function clearDocumentInput() {
+    setDocumentFile(null);
+    setDocumentInput("");
+    setDocumentAnalysis(null);
+  }
+
   const approvalRequired = !!result?.approval_required;
 
   return (
@@ -193,6 +255,72 @@ export default function Communicator() {
 
       <div className="grid gap-4 p-4 xl:grid-cols-[420px_minmax(0,1fr)]">
         <div className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2"><FileSearch className="size-5" /> Analýza PDF / HTML dokumentu</CardTitle>
+              <CardDescription>Nahraj PDF, HTML/TXT soubor nebo vlož HTML/text. Aplikace vytáhne fakta, rizika a sama předvyplní zadání.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <Field label="Režim analýzy">
+                  <select className="h-10 w-full rounded-md border bg-background px-3 text-sm" value={documentModeHint} onChange={(e) => setDocumentModeHint(e.target.value as any)}>
+                    <option value="auto">Automaticky rozpoznat</option>
+                    <option value="client">Klientská komunikace</option>
+                    <option value="review">Recenze</option>
+                  </select>
+                </Field>
+                <Field label="PDF / HTML / TXT soubor">
+                  <div className="flex items-center gap-2">
+                    <Input type="file" accept=".pdf,.html,.htm,.txt,.md,application/pdf,text/html,text/plain" onChange={(e) => setDocumentFile(e.target.files?.[0] || null)} />
+                  </div>
+                </Field>
+              </div>
+
+              {documentFile && (
+                <div className="flex items-center gap-2 rounded-lg border bg-muted/30 px-3 py-2 text-sm">
+                  <FileText className="size-4" />
+                  <span className="truncate">{documentFile.name}</span>
+                  <Badge variant="outline">{Math.ceil(documentFile.size / 1024)} KB</Badge>
+                </div>
+              )}
+
+              <Field label="Nebo vlož HTML/text dokumentu">
+                <Textarea value={documentInput} onChange={(e) => setDocumentInput(e.target.value)} rows={5} placeholder="Sem vlož HTML stránky, e-mail, recenzi, PDF text nebo jiný podklad..." />
+              </Field>
+
+              <div className="grid gap-2 md:grid-cols-3">
+                <Button variant="outline" onClick={() => analyzeDocument.mutate({ autoGenerate: false })} disabled={analyzeDocument.isPending}>
+                  <Upload className="mr-2 size-4" /> {analyzeDocument.isPending ? "Analyzuji..." : "Analyzovat a předvyplnit"}
+                </Button>
+                <Button onClick={() => analyzeDocument.mutate({ autoGenerate: true })} disabled={analyzeDocument.isPending || generate.isPending}>
+                  <Wand2 className="mr-2 size-4" /> Analyzovat + generovat
+                </Button>
+                <Button variant="ghost" onClick={clearDocumentInput} disabled={analyzeDocument.isPending}>Vyčistit</Button>
+              </div>
+
+              {documentAnalysis && (
+                <div className="space-y-3 rounded-lg border bg-background p-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge>{documentAnalysis.form_patch.mode === "review" ? "Recenze" : "Klient"}</Badge>
+                    <Badge variant={documentAnalysis.form_patch.risk_level === "high" || documentAnalysis.form_patch.risk_level === "critical" ? "destructive" : "secondary"}>Riziko: {documentAnalysis.form_patch.risk_level || "medium"}</Badge>
+                    <Badge variant="outline">Důvěra: {documentAnalysis.analysis.confidence || "medium"}</Badge>
+                    {documentAnalysis.ocr_used && <Badge variant="outline">OCR použito</Badge>}
+                  </div>
+                  <p className="text-sm text-muted-foreground">{documentAnalysis.analysis.summary || documentAnalysis.text_preview}</p>
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <ListBox title="Vytěžená fakta" items={documentAnalysis.analysis.extracted_facts} />
+                    <ListBox title="Co ještě ověřit" items={documentAnalysis.analysis.missing_information} danger />
+                    <ListBox title="Rizika z dokumentu" items={documentAnalysis.analysis.risks} danger />
+                    <div className="rounded-lg border bg-muted/20 p-4 text-sm">
+                      <div className="mb-2 font-medium">Doporučený další krok</div>
+                      <p className="text-muted-foreground">{documentAnalysis.analysis.suggested_action || "Ověřit fakta a až poté použít návrh odpovědi."}</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
           <Card>
             <CardHeader>
               <CardTitle>Zadání</CardTitle>

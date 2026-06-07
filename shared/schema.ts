@@ -173,6 +173,15 @@ export interface DatovkaMailbox {
   id_ds: string | null;
   ico: string | null;
   notes: string | null;
+  live_access_enabled?: boolean | null;
+  is_test?: boolean | null;
+  sync_days?: number | null;
+  sync_limit?: number | null;
+  sync_status?: string | null;
+  sync_error?: string | null;
+  last_sync_at?: string | null;
+  password_expires_at?: string | null;
+  live_info?: any;
   created_at: string;
 }
 
@@ -230,6 +239,12 @@ export const insertDatovkaMailboxSchema = z.object({
   id_ds: z.string().optional().nullable(),
   ico: z.string().optional().nullable(),
   notes: z.string().optional().nullable(),
+  live_access_enabled: z.boolean().optional().nullable(),
+  is_test: z.boolean().optional().nullable(),
+  login: z.string().optional().nullable(),
+  password: z.string().optional().nullable(),
+  sync_days: z.coerce.number().int().min(1).max(365).optional().nullable(),
+  sync_limit: z.coerce.number().int().min(1).max(1000).optional().nullable(),
 });
 export type InsertDatovkaMailbox = z.infer<typeof insertDatovkaMailboxSchema>;
 

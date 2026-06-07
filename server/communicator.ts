@@ -21,6 +21,10 @@ export const communicationGenerateSchema = z.object({
   review_platform: z.string().optional().default(""),
   review_rating: z.string().optional().default(""),
   review_text: z.string().optional().default(""),
+  source_document_name: z.string().optional().default(""),
+  source_document_type: z.string().optional().default(""),
+  source_document_summary: z.string().optional().default(""),
+  source_document_text: z.string().optional().default(""),
   what_happened: z.string().optional().default(""),
   what_we_know: z.string().optional().default(""),
   what_we_do_not_know: z.string().optional().default(""),
@@ -111,6 +115,13 @@ ${input.client_message || "(neuvedeno)"}
 Platforma: ${input.review_platform || "(netýká se)"}
 Hodnocení: ${input.review_rating || "(neuvedeno)"}
 Text recenze: ${input.review_text || "(neuvedeno)"}
+
+=== Zdrojový dokument / automatická analýza ===
+Název dokumentu: ${input.source_document_name || "(neuvedeno)"}
+Typ dokumentu: ${input.source_document_type || "(neuvedeno)"}
+Shrnutí dokumentu: ${input.source_document_summary || "(neuvedeno)"}
+Text / relevantní výňatek dokumentu:
+${(input.source_document_text || "(neuvedeno)").slice(0, 22000)}
 
 === Co se stalo ===
 ${input.what_happened || "(neuvedeno)"}
@@ -258,6 +269,177 @@ export async function generateCommunication(input: CommunicationGenerateInput): 
     html_output: result.html_output || fallbackHtml(result.subject || fallback.subject, body, input.mode === "review" ? "Kontaktovat podporu" : "Kontaktovat nás"),
     approval_required: Boolean(result.approval_required ?? fallback.approval_required),
   };
+}
+
+
+const DOCUMENT_ANALYSIS_SCHEMA = `{
+  "mode": "client|review",
+  "client_name": "...",
+  "client_email": "...",
+  "product_type": "...",
+  "situation_type": "delayed_reply|gold_deposit|delivery_delay|complaint|refund|legal_notice|aml|review_negative|review_positive|general",
+  "client_message": "...",
+  "review_platform": "...",
+  "review_rating": "...",
+  "review_text": "...",
+  "what_happened": "...",
+  "what_we_know": "...",
+  "what_we_do_not_know": "...",
+  "what_we_can_promise": "...",
+  "what_we_must_not_promise": "...",
+  "tone": "human_apology|legally_cautious|crisis|formal|vip|short|public_safe",
+  "risk_level": "low|medium|high|critical",
+  "extra_instructions": "...",
+  "summary": "...",
+  "extracted_facts": ["..."],
+  "missing_information": ["..."],
+  "risks": ["..."],
+  "suggested_action": "...",
+  "confidence": "low|medium|high"
+}`;
+
+const SYS_DOCUMENT_ANALYZER = `Jsi analytik obchodní, právní a klientské komunikace pro českou společnost obchodující s drahými kovy.
+Z vloženého PDF/HTML/textového dokumentu máš připravit strukturované zadání pro komunikační modul.
+
+Cíl:
+- vytáhni podstatná fakta, požadavek klienta, typ situace, rizika a doporučený tón,
+- připrav hodnoty tak, aby uživatel nemusel ručně vyplňovat formulář,
+- pokud jde o veřejnou recenzi, nastav mode=review a vyplň review_* pole,
+- pokud jde o e-mail, reklamaci, výzvu, objednávku, datovou zprávu nebo interní podklad, nastav mode=client,
+- nevymýšlej jména, částky, termíny ani právní závěry; neověřené údaje dej do missing_information nebo what_we_do_not_know,
+- u Gold Deposit, deponovaného zlata, výnosu, odměny, refundace, advokáta, banky, AML, custody a zpožděného dodání nastav high nebo critical podle povahy věci,
+- vždy vrať pouze validní JSON podle schématu.`;
+
+export interface CommunicationDocumentAnalysis {
+  mode: "client" | "review";
+  client_name?: string;
+  client_email?: string;
+  product_type?: string;
+  situation_type?: string;
+  client_message?: string;
+  review_platform?: string;
+  review_rating?: string;
+  review_text?: string;
+  what_happened?: string;
+  what_we_know?: string;
+  what_we_do_not_know?: string;
+  what_we_can_promise?: string;
+  what_we_must_not_promise?: string;
+  tone?: string;
+  risk_level?: "low" | "medium" | "high" | "critical";
+  extra_instructions?: string;
+  summary?: string;
+  extracted_facts?: string[];
+  missing_information?: string[];
+  risks?: string[];
+  suggested_action?: string;
+  confidence?: "low" | "medium" | "high";
+}
+
+export async function analyzeCommunicationDocument(opts: {
+  filename?: string;
+  mimeType?: string;
+  text: string;
+  modeHint?: "client" | "review" | "auto";
+  provider?: string;
+  model?: string;
+}): Promise<CommunicationDocumentAnalysis> {
+  const raw = (opts.text || "").trim();
+  const fallback = fallbackDocumentAnalysis(raw, opts.filename || "", opts.modeHint || "auto");
+  if (!raw) return fallback;
+
+  const pm = resolveProviderModel(config.ai.draftModel, opts.provider, opts.model);
+  const prompt = `=== Dokument ===\nNázev: ${opts.filename || "(bez názvu)"}\nMIME/type: ${opts.mimeType || "(neuvedeno)"}\nPreferovaný režim: ${opts.modeHint || "auto"}\n\n=== Extrahovaný text ===\n${raw.slice(0, 30000)}\n\nVrať strukturované zadání pro komunikaci. Pokud text obsahuje více nesouvisejících věcí, zaměř se na nejrizikovější nebo hlavní klientský požadavek.`;
+
+  try {
+    const json = await llmJSON(SYS_DOCUMENT_ANALYZER, prompt, DOCUMENT_ANALYSIS_SCHEMA, pm);
+    const result = typeof json === "object" && json ? json as Partial<CommunicationDocumentAnalysis> : {};
+    return normalizeDocumentAnalysis({ ...fallback, ...result });
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function normalizeDocumentAnalysis(x: Partial<CommunicationDocumentAnalysis>): CommunicationDocumentAnalysis {
+  const mode = x.mode === "review" ? "review" : "client";
+  const risk = ["low", "medium", "high", "critical"].includes(String(x.risk_level)) ? x.risk_level as any : "medium";
+  return {
+    mode,
+    client_name: cleanLine(x.client_name),
+    client_email: cleanLine(x.client_email),
+    product_type: cleanLine(x.product_type) || "Investiční zlato",
+    situation_type: cleanLine(x.situation_type) || (mode === "review" ? "review_negative" : "general"),
+    client_message: cleanBlock(x.client_message),
+    review_platform: cleanLine(x.review_platform),
+    review_rating: cleanLine(x.review_rating),
+    review_text: cleanBlock(x.review_text),
+    what_happened: cleanBlock(x.what_happened),
+    what_we_know: cleanBlock(x.what_we_know),
+    what_we_do_not_know: cleanBlock(x.what_we_do_not_know),
+    what_we_can_promise: cleanBlock(x.what_we_can_promise),
+    what_we_must_not_promise: cleanBlock(x.what_we_must_not_promise),
+    tone: cleanLine(x.tone) || (mode === "review" ? "public_safe" : "legally_cautious"),
+    risk_level: risk,
+    extra_instructions: cleanBlock(x.extra_instructions),
+    summary: cleanBlock(x.summary),
+    extracted_facts: normalizeArray(x.extracted_facts),
+    missing_information: normalizeArray(x.missing_information),
+    risks: normalizeArray(x.risks),
+    suggested_action: cleanBlock(x.suggested_action),
+    confidence: x.confidence === "high" || x.confidence === "low" ? x.confidence : "medium",
+  };
+}
+
+function fallbackDocumentAnalysis(text: string, filename: string, modeHint: string): CommunicationDocumentAnalysis {
+  const lower = `${filename}\n${text}`.toLowerCase();
+  const looksReview = modeHint === "review" || /(google|heureka|firmy\.cz|recenz|hvězd|stars?|★|⭐)/i.test(text.slice(0, 5000));
+  const email = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] || "";
+  const risk: "low" | "medium" | "high" | "critical" = /(advokát|předžalob|žalob|policie|čnb|faú|banka|aml|trestn|zpronevěr)/i.test(lower)
+    ? "critical"
+    : /(refund|vrácení peněz|odměn|výnos|deponovan|gold deposit|custody|nedodán|prodlen|reklamac|stížnost)/i.test(lower)
+      ? "high"
+      : "medium";
+  const situation = /(advokát|předžalob|žalob)/i.test(lower) ? "legal_notice"
+    : /(aml|identifikac|faú)/i.test(lower) ? "aml"
+    : /(refund|vrácení peněz|storno)/i.test(lower) ? "refund"
+    : /(deponovan|gold deposit|odměn|výnos)/i.test(lower) ? "gold_deposit"
+    : /(nedodán|dodání|zdrž|skladem|objednávk)/i.test(lower) ? "delivery_delay"
+    : looksReview ? "review_negative"
+    : /(reklamac|stížnost|nespokojen)/i.test(lower) ? "complaint"
+    : "general";
+  const excerpt = text.replace(/\s+/g, " ").trim().slice(0, 1800);
+  return {
+    mode: looksReview ? "review" : "client",
+    client_email: email,
+    product_type: /(deponovan|gold deposit|gold pool)/i.test(lower) ? "Gold Deposit" : "Investiční zlato",
+    situation_type: situation,
+    client_message: looksReview ? "" : excerpt,
+    review_platform: /heureka/i.test(lower) ? "Heureka" : /firmy/i.test(lower) ? "Firmy.cz" : /google/i.test(lower) ? "Google" : "Import dokumentu",
+    review_rating: text.match(/([1-5]\s*(?:\/\s*5|hvězdič(?:ek|ky|ka)?|stars?))|([★⭐]{1,5})/i)?.[0] || "",
+    review_text: looksReview ? excerpt : "",
+    what_happened: excerpt,
+    what_we_know: "Automaticky extrahováno z dokumentu. Před odesláním ověřit fakta proti smlouvám, objednávce a interní evidenci.",
+    what_we_do_not_know: "Přesný právní stav, splnění smluvních podmínek, aktuální stav objednávky/platby/kovu a ověřený termín dalšího kroku.",
+    what_we_can_promise: "Lze slíbit pouze prověření věci a konkrétní následný kontakt v ověřeném termínu.",
+    what_we_must_not_promise: "Neslibovat neověřený termín, výplatu, refundaci, právní nárok, uznání dluhu ani porušení smlouvy bez schválení.",
+    tone: looksReview ? "public_safe" : (risk === "critical" ? "legally_cautious" : "human_apology"),
+    risk_level: risk,
+    extra_instructions: "Text byl předvyplněn z dokumentu. Před použitím ověřit extrahovaná fakta a odstranit vše, co není potvrzené.",
+    summary: excerpt || "Dokument se nepodařilo spolehlivě shrnout bez ruční kontroly.",
+    extracted_facts: excerpt ? [excerpt] : [],
+    missing_information: ["Ověřit identitu klienta", "Ověřit smlouvu/objednávku", "Ověřit aktuální stav plnění", "Ověřit, co již bylo klientovi slíbeno"],
+    risks: risk === "critical" ? ["Možná právní výzva nebo institucionální komunikace", "Vyžaduje právní/management schválení"] : ["Automatická extrakce může být neúplná", "Před odesláním ověřit fakta"],
+    suggested_action: "Nejdříve ověřit fakta v interní evidenci, poté použít bezpečnou odpověď bez neověřených slibů.",
+    confidence: text.trim().length > 400 ? "medium" : "low",
+  };
+}
+
+function cleanLine(value: unknown): string {
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, 500) : "";
+}
+
+function cleanBlock(value: unknown): string {
+  return typeof value === "string" ? value.trim().slice(0, 12000) : "";
 }
 
 export const BUILTIN_COMMUNICATION_TEMPLATES = [

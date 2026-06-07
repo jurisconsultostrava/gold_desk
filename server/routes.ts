@@ -9,12 +9,13 @@ import {
   gmailConfigured,
 } from "./config";
 import { supabase } from "./supabase";
-import { encrypt } from "./crypto";
+import { encrypt, decrypt } from "./crypto";
 import { insertImapAccountSchema, updateAccountFiltersSchema, insertDatovkaMailboxSchema } from "@shared/schema";
 import multer from "multer";
 import { parseZfo } from "./datovka/zfo-parser";
 import { extractAttachmentText } from "./datovka/extract";
 import { classifyDatovkaMessage } from "./datovka/ai";
+import { testDataboxCredentials, syncDataboxMailbox } from "./datovka/live-client";
 import { testImapConnection, syncImapAccount, classifyThreadAsync } from "./connectors/imap";
 import {
   buildOutlookAuthUrl,
@@ -30,7 +31,8 @@ import {
 } from "./connectors/gmail";
 import { sendViaSmtp } from "./connectors/smtp";
 import { aiConfigured, draftReply, documentQA, getAIConfigInfo } from "./ai";
-import { BUILTIN_COMMUNICATION_TEMPLATES, communicationGenerateSchema, generateCommunication } from "./communicator";
+import { BUILTIN_COMMUNICATION_TEMPLATES, analyzeCommunicationDocument, communicationGenerateSchema, generateCommunication } from "./communicator";
+import { extractText } from "./extract";
 import { anthropicConfigured, openaiConfigured, perplexityConfigured, geminiConfigured } from "./config";
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
@@ -42,6 +44,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       encryption: encryptionConfigured(),
       outlook: outlookConfigured(),
       gmail: gmailConfigured(),
+      databox_bridge: true,
       ai: aiConfigured(),
       gemini: geminiConfigured(),
       anthropic: anthropicConfigured(),
@@ -376,13 +379,34 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   const DATOVKA_BUCKET = "datovka-files";
 
+  function datovkaPublicColumns() {
+    return "id,user_id,name,id_ds,ico,notes,live_access_enabled,is_test,sync_days,sync_limit,sync_status,sync_error,last_sync_at,password_expires_at,live_info,created_at";
+  }
+
+  function datovkaMailboxPatch(parsed: any, existing?: any): Record<string, any> {
+    const patch: Record<string, any> = {};
+    for (const k of ["name", "id_ds", "ico", "notes", "live_access_enabled", "is_test", "sync_days", "sync_limit"]) {
+      if (parsed[k] !== undefined) patch[k] = parsed[k];
+    }
+    if (parsed.login !== undefined && String(parsed.login || "").trim()) {
+      patch.login_enc = encrypt(String(parsed.login).trim());
+      patch.live_access_enabled = parsed.live_access_enabled ?? true;
+    }
+    if (parsed.password !== undefined && String(parsed.password || "")) {
+      patch.password_enc = encrypt(String(parsed.password));
+      patch.live_access_enabled = parsed.live_access_enabled ?? true;
+    }
+    if (!existing && patch.live_access_enabled === undefined) patch.live_access_enabled = false;
+    return patch;
+  }
+
   // GET /api/datovka/mailboxes
   app.get("/api/datovka/mailboxes", asyncH(async (_req, res) => {
     requireSupabase();
     const sb = supabase()!;
     const { data, error } = await sb
       .from("datovka_mailboxes")
-      .select("*")
+      .select(datovkaPublicColumns())
       .eq("user_id", config.userId)
       .order("created_at", { ascending: true });
     if (error) throw error;
@@ -392,12 +416,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // POST /api/datovka/mailboxes
   app.post("/api/datovka/mailboxes", asyncH(async (req, res) => {
     requireSupabase();
+    requireEnc();
     const parsed = insertDatovkaMailboxSchema.parse(req.body);
     const sb = supabase()!;
+    const insert = { ...datovkaMailboxPatch(parsed), user_id: config.userId };
     const { data, error } = await sb
       .from("datovka_mailboxes")
-      .insert({ ...parsed, user_id: config.userId })
-      .select()
+      .insert(insert)
+      .select(datovkaPublicColumns())
       .single();
     if (error) throw error;
     res.status(201).json(data);
@@ -406,18 +432,69 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // PATCH /api/datovka/mailboxes/:id
   app.patch("/api/datovka/mailboxes/:id", asyncH(async (req, res) => {
     requireSupabase();
+    requireEnc();
     const sb = supabase()!;
     const id = String(req.params.id);
     const parsed = insertDatovkaMailboxSchema.partial().parse(req.body);
-    const { data, error } = await sb
+    const { data: existing, error: fetchErr } = await sb
       .from("datovka_mailboxes")
-      .update(parsed)
+      .select("*")
       .eq("id", id)
       .eq("user_id", config.userId)
-      .select()
+      .single();
+    if (fetchErr || !existing) return res.status(404).json({ message: "Datová schránka nenalezena" });
+    const patch = datovkaMailboxPatch(parsed, existing);
+    const { data, error } = await sb
+      .from("datovka_mailboxes")
+      .update(patch)
+      .eq("id", id)
+      .eq("user_id", config.userId)
+      .select(datovkaPublicColumns())
       .single();
     if (error) throw error;
     res.json(data);
+  }));
+
+  // POST /api/datovka/mailboxes/:id/test-live
+  app.post("/api/datovka/mailboxes/:id/test-live", asyncH(async (req, res) => {
+    requireSupabase();
+    requireEnc();
+    const sb = supabase()!;
+    const id = String(req.params.id);
+    const { data: mailbox, error } = await sb
+      .from("datovka_mailboxes")
+      .select("*")
+      .eq("id", id)
+      .eq("user_id", config.userId)
+      .single();
+    if (error || !mailbox) return res.status(404).json({ message: "Datová schránka nenalezena" });
+    if (!mailbox.login_enc || !mailbox.password_enc) {
+      return res.status(400).json({ message: "Nejdřív ulož login a heslo k ISDS." });
+    }
+    const result = await testDataboxCredentials({
+      username: decrypt(mailbox.login_enc),
+      password: decrypt(mailbox.password_enc),
+      is_test: !!mailbox.is_test,
+    });
+    await sb.from("datovka_mailboxes").update({
+      password_expires_at: result.password_expires_at || null,
+      live_info: { owner: result.owner || null, user: result.user || null, tested_at: new Date().toISOString() },
+      sync_error: null,
+      sync_status: "idle",
+    }).eq("id", id);
+    res.json({ ok: true, password_expires_at: result.password_expires_at || null, owner: result.owner || null, user: result.user || null });
+  }));
+
+  // POST /api/datovka/mailboxes/:id/sync-live
+  app.post("/api/datovka/mailboxes/:id/sync-live", asyncH(async (req, res) => {
+    requireSupabase();
+    requireEnc();
+    const id = String(req.params.id);
+    const days = req.body?.days ? Number(req.body.days) : undefined;
+    const limit = req.body?.limit ? Number(req.body.limit) : undefined;
+    // For small manual syncs we return the result directly. Railway can run this request safely for common 10-100 message windows.
+    const result = await syncDataboxMailbox(id, { days, limit, direction: "received" });
+    res.json(result);
   }));
 
   // DELETE /api/datovka/mailboxes/:id
@@ -818,6 +895,102 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(data || []);
   }));
 
+  const communicatorUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 25 * 1024 * 1024, files: 1 },
+  });
+
+  app.post("/api/communicator/analyze-document", communicatorUpload.single("file"), asyncH(async (req, res) => {
+    const file = req.file;
+    const pasted = typeof req.body?.html_text === "string" ? req.body.html_text : "";
+    const modeHintRaw = String(req.body?.mode_hint || "auto");
+    const modeHint = modeHintRaw === "client" || modeHintRaw === "review" ? modeHintRaw : "auto";
+    const provider = req.body?.provider ? String(req.body.provider) : undefined;
+    const model = req.body?.model ? String(req.body.model) : undefined;
+
+    let extractedText = "";
+    let ocrUsed = false;
+    let filename = "vlozeny-dokument.txt";
+    let mimeType = "text/plain";
+
+    if (file) {
+      filename = file.originalname || filename;
+      mimeType = file.mimetype || guessMime(filename);
+      if (isHtml(filename, mimeType)) {
+        extractedText = htmlToPlainText(file.buffer.toString("utf8"));
+      } else if (isPlainText(filename, mimeType)) {
+        extractedText = file.buffer.toString("utf8");
+      } else {
+        const extracted = await extractText(filename, mimeType, file.buffer);
+        extractedText = extracted.text;
+        ocrUsed = extracted.ocrUsed;
+      }
+    } else if (pasted.trim()) {
+      filename = "vlozeny-html-nebo-text.html";
+      mimeType = "text/html";
+      extractedText = looksLikeHtml(pasted) ? htmlToPlainText(pasted) : pasted;
+    } else {
+      return res.status(400).json({ message: "Nahraj PDF/HTML/TXT soubor nebo vlož HTML/text dokumentu." });
+    }
+
+    extractedText = normalizeExtractedText(extractedText);
+    if (!extractedText || extractedText.length < 20) {
+      return res.status(422).json({ message: "Z dokumentu se nepodařilo získat použitelný text. U skenovaného PDF zkontroluj kvalitu nebo vlož text ručně." });
+    }
+
+    const analysis = await analyzeCommunicationDocument({ filename, mimeType, text: extractedText, modeHint, provider, model });
+    const sourceText = extractedText.slice(0, 24000);
+    const formPatch = {
+      mode: analysis.mode,
+      client_name: analysis.client_name || "",
+      client_email: analysis.client_email || "",
+      product_type: analysis.product_type || "Investiční zlato",
+      situation_type: analysis.situation_type || (analysis.mode === "review" ? "review_negative" : "general"),
+      client_message: analysis.client_message || "",
+      review_platform: analysis.review_platform || "",
+      review_rating: analysis.review_rating || "",
+      review_text: analysis.review_text || "",
+      what_happened: analysis.what_happened || "",
+      what_we_know: analysis.what_we_know || "",
+      what_we_do_not_know: analysis.what_we_do_not_know || "",
+      what_we_can_promise: analysis.what_we_can_promise || "",
+      what_we_must_not_promise: analysis.what_we_must_not_promise || "",
+      tone: analysis.tone || (analysis.mode === "review" ? "public_safe" : "legally_cautious"),
+      risk_level: analysis.risk_level || "medium",
+      extra_instructions: analysis.extra_instructions || "",
+      source_document_name: filename,
+      source_document_type: mimeType,
+      source_document_summary: analysis.summary || "",
+      source_document_text: sourceText,
+      desired_output_types: {
+        email: analysis.mode === "client",
+        sms: analysis.mode === "client",
+        whatsapp: analysis.mode === "client",
+        phone_script: analysis.mode === "client",
+        internal_note: true,
+        html: true,
+      },
+    };
+
+    res.json({
+      ok: true,
+      filename,
+      mime_type: mimeType,
+      ocr_used: ocrUsed,
+      extracted_text: sourceText,
+      text_preview: extractedText.slice(0, 2500),
+      form_patch: formPatch,
+      analysis: {
+        summary: analysis.summary,
+        extracted_facts: analysis.extracted_facts || [],
+        missing_information: analysis.missing_information || [],
+        risks: analysis.risks || [],
+        suggested_action: analysis.suggested_action || "",
+        confidence: analysis.confidence || "medium",
+      },
+    });
+  }));
+
   app.post("/api/communicator/generate", asyncH(async (req, res) => {
     const parsed = communicationGenerateSchema.parse(req.body || {});
     const result = await generateCommunication(parsed);
@@ -922,4 +1095,51 @@ function requireEnc() {
     err.status = 503;
     throw err;
   }
+}
+
+function guessMime(filename: string): string {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith(".pdf")) return "application/pdf";
+  if (lower.endsWith(".html") || lower.endsWith(".htm")) return "text/html";
+  if (lower.endsWith(".txt") || lower.endsWith(".md")) return "text/plain";
+  return "application/octet-stream";
+}
+
+function isHtml(filename: string, mime: string): boolean {
+  const lower = filename.toLowerCase();
+  return lower.endsWith(".html") || lower.endsWith(".htm") || mime.includes("html");
+}
+
+function isPlainText(filename: string, mime: string): boolean {
+  const lower = filename.toLowerCase();
+  return lower.endsWith(".txt") || lower.endsWith(".md") || mime.startsWith("text/plain");
+}
+
+function looksLikeHtml(value: string): boolean {
+  return /<\s*(html|body|div|p|table|section|article|span|br|h[1-6])\b/i.test(value);
+}
+
+function htmlToPlainText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<br\s*\/?\s*>/gi, "\n")
+    .replace(/<\/(p|div|li|tr|h[1-6]|section|article)>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\r/g, "\n");
+}
+
+function normalizeExtractedText(text: string): string {
+  return text
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{4,}/g, "\n\n\n")
+    .trim();
 }

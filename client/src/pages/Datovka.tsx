@@ -113,6 +113,39 @@ async function apiFetch(url: string, opts?: RequestInit) {
 
 // ─── MailboxesDialog ──────────────────────────────────────────────────────────
 
+type DatovkaMailboxForm = {
+  name: string;
+  id_ds: string;
+  ico: string;
+  notes: string;
+  live_access_enabled: boolean;
+  is_test: boolean;
+  login: string;
+  password: string;
+  sync_days: string;
+  sync_limit: string;
+};
+
+const emptyMailboxForm: DatovkaMailboxForm = {
+  name: "",
+  id_ds: "",
+  ico: "",
+  notes: "",
+  live_access_enabled: false,
+  is_test: false,
+  login: "",
+  password: "",
+  sync_days: "90",
+  sync_limit: "100",
+};
+
+function formatDateTime(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleString("cs-CZ", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
 function MailboxesDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const qc = useQueryClient();
   const { toast } = useToast();
@@ -121,26 +154,39 @@ function MailboxesDialog({ open, onClose }: { open: boolean; onClose: () => void
     queryFn: () => apiFetch("/api/datovka/mailboxes"),
   });
 
-  const [form, setForm] = useState({ name: "", id_ds: "", ico: "", notes: "" });
+  const [form, setForm] = useState<DatovkaMailboxForm>(emptyMailboxForm);
   const [editId, setEditId] = useState<string | null>(null);
+
+  const payload = () => ({
+    name: form.name,
+    id_ds: form.id_ds || null,
+    ico: form.ico || null,
+    notes: form.notes || null,
+    live_access_enabled: form.live_access_enabled,
+    is_test: form.is_test,
+    login: form.login || null,
+    password: form.password || null,
+    sync_days: Number(form.sync_days || 90),
+    sync_limit: Number(form.sync_limit || 100),
+  });
 
   const saveMut = useMutation({
     mutationFn: async () => {
       if (editId) {
         return apiFetch(`/api/datovka/mailboxes/${editId}`, {
           method: "PATCH",
-          body: JSON.stringify(form),
+          body: JSON.stringify(payload()),
         });
       } else {
         return apiFetch("/api/datovka/mailboxes", {
           method: "POST",
-          body: JSON.stringify(form),
+          body: JSON.stringify(payload()),
         });
       }
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["/api/datovka/mailboxes"] });
-      setForm({ name: "", id_ds: "", ico: "", notes: "" });
+      setForm(emptyMailboxForm);
       setEditId(null);
       toast({ title: editId ? "Schránka upravena" : "Schránka přidána" });
     },
@@ -156,27 +202,89 @@ function MailboxesDialog({ open, onClose }: { open: boolean; onClose: () => void
     onError: (e: any) => toast({ title: "Chyba", description: e.message, variant: "destructive" }),
   });
 
+  const testMut = useMutation({
+    mutationFn: (id: string) => apiFetch(`/api/datovka/mailboxes/${id}/test-live`, { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["/api/datovka/mailboxes"] });
+      toast({ title: "Přístup k datové schránce funguje" });
+    },
+    onError: (e: any) => toast({ title: "ISDS přihlášení selhalo", description: e.message, variant: "destructive" }),
+  });
+
+  const syncMut = useMutation({
+    mutationFn: (m: DatovkaMailbox) => apiFetch(`/api/datovka/mailboxes/${m.id}/sync-live`, {
+      method: "POST",
+      body: JSON.stringify({ days: m.sync_days || 90, limit: m.sync_limit || 100 }),
+    }),
+    onSuccess: (data: any) => {
+      qc.invalidateQueries({ queryKey: ["/api/datovka/mailboxes"] });
+      qc.invalidateQueries({ queryKey: ["/api/datovka/messages"] });
+      toast({ title: `Synchronizace dokončena`, description: `Staženo: ${data.fetched || 0}, uloženo: ${data.inserted || 0}, přeskočeno: ${data.skipped || 0}` });
+    },
+    onError: (e: any) => toast({ title: "Synchronizace selhala", description: e.message, variant: "destructive" }),
+  });
+
   function startEdit(m: DatovkaMailbox) {
     setEditId(m.id);
-    setForm({ name: m.name, id_ds: m.id_ds || "", ico: m.ico || "", notes: m.notes || "" });
+    setForm({
+      name: m.name,
+      id_ds: m.id_ds || "",
+      ico: m.ico || "",
+      notes: m.notes || "",
+      live_access_enabled: !!m.live_access_enabled,
+      is_test: !!m.is_test,
+      login: "",
+      password: "",
+      sync_days: String(m.sync_days || 90),
+      sync_limit: String(m.sync_limit || 100),
+    });
+  }
+
+  function resetForm() {
+    setEditId(null);
+    setForm(emptyMailboxForm);
   }
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-w-lg">
+      <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Správa datových schránek</DialogTitle>
         </DialogHeader>
         <div className="space-y-3 mt-2">
+          <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:bg-amber-950/30 dark:border-amber-900 dark:text-amber-200">
+            Přístupové údaje k ISDS se ukládají šifrovaně přes <code>MAILROOM_ENCRYPTION_KEY</code>. Pro produkci používej samostatného pověřeného uživatele, ne osobní hlavní přihlášení jednatele.
+          </div>
+
           {mailboxes.map((m) => (
-            <div key={m.id} className="flex items-start gap-2 p-2 border rounded-md">
+            <div key={m.id} className="flex items-start gap-2 p-3 border rounded-md">
               <div className="flex-1 min-w-0">
-                <div className="font-medium text-sm">{m.name}</div>
-                <div className="text-xs text-muted-foreground">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="font-medium text-sm">{m.name}</div>
+                  {m.live_access_enabled && <Badge variant="outline" className="text-[10px]">ISDS online</Badge>}
+                  {m.is_test && <Badge variant="secondary" className="text-[10px]">test</Badge>}
+                  {m.sync_status && m.sync_status !== "idle" && (
+                    <Badge variant={m.sync_status === "error" ? "destructive" : "secondary"} className="text-[10px]">{m.sync_status}</Badge>
+                  )}
+                </div>
+                <div className="text-xs text-muted-foreground mt-1">
                   {m.id_ds && <span>ID DS: {m.id_ds}</span>}
                   {m.ico && <span className="ml-2">IČO: {m.ico}</span>}
+                  <span className="ml-2">Poslední sync: {formatDateTime(m.last_sync_at)}</span>
                 </div>
+                {m.password_expires_at && (
+                  <div className="text-xs text-muted-foreground mt-0.5">Expirace hesla: {formatDateTime(m.password_expires_at)}</div>
+                )}
+                {m.sync_error && (
+                  <div className="text-xs text-red-600 mt-1 flex gap-1 items-center"><AlertTriangle className="size-3" /> {m.sync_error}</div>
+                )}
               </div>
+              <Button size="sm" variant="outline" onClick={() => testMut.mutate(m.id)} disabled={!m.live_access_enabled || testMut.isPending}>
+                {testMut.isPending ? <Loader2 className="size-3.5 animate-spin" /> : "Test"}
+              </Button>
+              <Button size="sm" variant="outline" onClick={() => syncMut.mutate(m)} disabled={!m.live_access_enabled || syncMut.isPending}>
+                {syncMut.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <><RefreshCw className="size-3.5 mr-1" /> Sync</>}
+              </Button>
               <button onClick={() => startEdit(m)} className="p-1 hover:text-primary" title="Upravit">
                 <Pencil className="size-3.5" />
               </button>
@@ -193,14 +301,14 @@ function MailboxesDialog({ open, onClose }: { open: boolean; onClose: () => void
             <p className="text-sm text-muted-foreground">Zatím žádné schránky.</p>
           )}
 
-          <div className="border-t pt-3 mt-3 space-y-2">
+          <div className="border-t pt-3 mt-3 space-y-3">
             <div className="text-sm font-medium">{editId ? "Upravit schránku" : "Přidat novou schránku"}</div>
             <div>
               <Label className="text-xs">Název *</Label>
               <Input
                 value={form.name}
                 onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-                placeholder="Profigold s.r.o."
+                placeholder="Jurisconsult Ltd. o.z."
                 className="h-8 text-sm"
               />
             </div>
@@ -224,6 +332,69 @@ function MailboxesDialog({ open, onClose }: { open: boolean; onClose: () => void
                 />
               </div>
             </div>
+
+            <div className="grid grid-cols-2 gap-2 border rounded-md p-3 bg-muted/20">
+              <label className="col-span-2 flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={form.live_access_enabled}
+                  onChange={(e) => setForm((f) => ({ ...f, live_access_enabled: e.target.checked }))}
+                />
+                Povolit online přístup k datové schránce přes ISDS
+              </label>
+              <label className="col-span-2 flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={form.is_test}
+                  onChange={(e) => setForm((f) => ({ ...f, is_test: e.target.checked }))}
+                />
+                Testovací prostředí CZebox místo ostré produkce
+              </label>
+              <div>
+                <Label className="text-xs">Login ISDS</Label>
+                <Input
+                  value={form.login}
+                  onChange={(e) => setForm((f) => ({ ...f, login: e.target.value }))}
+                  placeholder={editId ? "ponechat beze změny" : "uživatelské jméno"}
+                  className="h-8 text-sm"
+                  autoComplete="off"
+                />
+              </div>
+              <div>
+                <Label className="text-xs">Heslo ISDS</Label>
+                <Input
+                  type="password"
+                  value={form.password}
+                  onChange={(e) => setForm((f) => ({ ...f, password: e.target.value }))}
+                  placeholder={editId ? "ponechat beze změny" : "heslo"}
+                  className="h-8 text-sm"
+                  autoComplete="new-password"
+                />
+              </div>
+              <div>
+                <Label className="text-xs">Synchronizovat posledních dní</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={365}
+                  value={form.sync_days}
+                  onChange={(e) => setForm((f) => ({ ...f, sync_days: e.target.value }))}
+                  className="h-8 text-sm"
+                />
+              </div>
+              <div>
+                <Label className="text-xs">Limit zpráv na synchronizaci</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={1000}
+                  value={form.sync_limit}
+                  onChange={(e) => setForm((f) => ({ ...f, sync_limit: e.target.value }))}
+                  className="h-8 text-sm"
+                />
+              </div>
+            </div>
+
             <div>
               <Label className="text-xs">Poznámky</Label>
               <Textarea
@@ -243,11 +414,7 @@ function MailboxesDialog({ open, onClose }: { open: boolean; onClose: () => void
                 {editId ? "Uložit změny" : "Přidat schránku"}
               </Button>
               {editId && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => { setEditId(null); setForm({ name: "", id_ds: "", ico: "", notes: "" }); }}
-                >
+                <Button size="sm" variant="outline" onClick={resetForm}>
                   Zrušit
                 </Button>
               )}

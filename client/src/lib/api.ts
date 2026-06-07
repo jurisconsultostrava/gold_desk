@@ -49,6 +49,10 @@ export interface CommunicatorInput {
   review_platform?: string;
   review_rating?: string;
   review_text?: string;
+  source_document_name?: string;
+  source_document_type?: string;
+  source_document_summary?: string;
+  source_document_text?: string;
   what_happened?: string;
   what_we_know?: string;
   what_we_do_not_know?: string;
@@ -90,7 +94,41 @@ export interface CommunicatorOutput {
   html_notes?: string[];
 }
 
+
+export interface CommunicatorDocumentAnalysis {
+  ok: boolean;
+  filename?: string;
+  mime_type?: string;
+  ocr_used?: boolean;
+  extracted_text?: string;
+  text_preview?: string;
+  form_patch: Partial<CommunicatorInput>;
+  analysis: {
+    summary?: string;
+    extracted_facts?: string[];
+    missing_information?: string[];
+    risks?: string[];
+    suggested_action?: string;
+    confidence?: "low" | "medium" | "high";
+  };
+}
+
+async function apiFormData(url: string, data: FormData): Promise<Response> {
+  const apiBase = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
+  const res = await fetch(`${apiBase}${url}`, { method: "POST", body: data });
+  if (!res.ok) {
+    const text = (await res.text()) || res.statusText;
+    throw new Error(`${res.status}: ${text}`);
+  }
+  return res;
+}
+
 export const api = {
+
+  async communicatorAnalyzeDocument(data: FormData): Promise<CommunicatorDocumentAnalysis> {
+    const r = await apiFormData("/api/communicator/analyze-document", data);
+    return r.json();
+  },
 
   async communicatorGenerate(input: CommunicatorInput): Promise<CommunicatorOutput> {
     const r = await apiRequest("POST", "/api/communicator/generate", input);
