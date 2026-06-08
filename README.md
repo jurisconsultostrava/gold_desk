@@ -398,3 +398,49 @@ Tyto hodnoty už mají default v Dockerfile, ale můžeš je v Railway přepsat.
 Modul `/communicator` nově podporuje nahrání PDF, HTML/HTM, TXT/MD souboru nebo vložení HTML/textu přímo do aplikace. Endpoint `/api/communicator/analyze-document` z dokumentu vytěží text, rozpozná typ komunikace, riziko, fakta, chybějící údaje a předvyplní formulář pro generování e-mailu, SMS, WhatsApp textu, telefonního skriptu, HTML kódu nebo reakce na recenzi.
 
 Detailní návod je v `COMMUNICATOR_DOCUMENT_IMPORT_README.md`.
+
+## Vstupní autentizace do aplikace
+
+Aplikace nyní podporuje jednoduché přihlášení jménem a heslem ještě před vstupem do Mailroom / GoldDesk UI.
+
+### Railway Variables
+
+Nastav v Railway:
+
+```env
+APP_AUTH_ENABLED=true
+APP_AUTH_USERNAME=admin
+APP_AUTH_PASSWORD=sem_dej_silne_heslo
+APP_SESSION_SECRET=dlouhy_nahodny_retezec_minimalne_32_znaku
+APP_COOKIE_SECURE=true
+```
+
+Bezpečnější varianta je nepoužívat prosté heslo, ale hash:
+
+```bash
+npm run auth:hash -- "moje-silne-heslo"
+```
+
+Výstup vlož do Railway jako:
+
+```env
+APP_AUTH_PASSWORD_HASH=scrypt:...
+```
+
+Pak v Railway smaž `APP_AUTH_PASSWORD`.
+
+### Chování
+
+- bez přihlášení se zobrazí login obrazovka,
+- API endpointy kromě `/api/status` a `/api/app-auth/*` jsou chráněné session cookie,
+- odhlášení je v levém dolním menu ikonou odhlášení,
+- session platí standardně 12 hodin (`APP_SESSION_MAX_AGE_MS=43200000`).
+
+Pokud testuješ produkční build lokálně přes obyčejné `http://`, nastav dočasně:
+
+```env
+APP_COOKIE_SECURE=false
+```
+
+Na Railway/HTTPS ponech `APP_COOKIE_SECURE=true`.
+
