@@ -5,6 +5,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/not-found";
+import Dashboard from "@/pages/Dashboard";
 import Inbox from "@/pages/Inbox";
 import ThreadDetail from "@/pages/ThreadDetail";
 import AttachmentViewer from "@/pages/AttachmentViewer";
@@ -17,7 +18,8 @@ import { AuthGate } from "@/components/AuthGate";
 function AppRouter() {
   return (
     <Switch>
-      <Route path="/" component={Inbox} />
+      <Route path="/" component={Dashboard} />
+      <Route path="/inbox" component={Inbox} />
       <Route path="/thread/:id" component={ThreadDetail} />
       <Route path="/attachment/:id" component={AttachmentViewer} />
       <Route path="/accounts" component={Accounts} />

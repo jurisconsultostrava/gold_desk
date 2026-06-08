@@ -18,6 +18,7 @@ import {
   MailOpen,
   MessageSquareText,
   LogOut,
+  Target,
 } from "lucide-react";
 import type { Account } from "@shared/schema";
 
@@ -70,13 +71,13 @@ export function Layout({ children }: { children: ReactNode }) {
   function catHref(c: string) {
     const sp = new URLSearchParams();
     if (c) sp.set("category", c);
-    return "/" + (sp.toString() ? "?" + sp.toString() : "");
+    return "/inbox" + (sp.toString() ? "?" + sp.toString() : "");
   }
   function filterHref(key: string, val: string) {
     const sp = new URLSearchParams();
     if (filters.category) sp.set("category", filters.category);
     sp.set(key, val);
-    return "/?" + sp.toString();
+    return "/inbox?" + sp.toString();
   }
 
 
@@ -90,13 +91,26 @@ export function Layout({ children }: { children: ReactNode }) {
       <aside className="w-64 shrink-0 border-r border-sidebar-border bg-sidebar text-sidebar-foreground flex flex-col">
         <div className="px-4 h-14 flex items-center gap-2 border-b border-sidebar-border text-primary">
           <Logo />
-          <div className="font-semibold tracking-tight">Mailroom</div>
+          <div className="font-semibold tracking-tight">GoldDesk</div>
         </div>
 
         <div className="px-3 py-3 space-y-0.5 overflow-y-auto flex-1">
-          <SectionLabel>Kategorie</SectionLabel>
+          <SectionLabel>Řízení</SectionLabel>
+          <Link
+            href="/"
+            className={`group flex items-center gap-2 px-2 py-1.5 text-sm rounded-md hover-elevate ${
+              location === "/" ? "bg-sidebar-accent text-sidebar-accent-foreground" : "text-sidebar-foreground/85"
+            }`}
+            data-testid="link-dashboard"
+          >
+            <Target className="size-4 text-muted-foreground group-hover:text-foreground" />
+            <span className="flex-1">Řídicí centrum</span>
+          </Link>
+
+          <div className="h-3" />
+          <SectionLabel>Kategorie pošty</SectionLabel>
           {CATEGORIES.map((c) => {
-            const active = filters.category === c.key;
+            const active = location.startsWith("/inbox") && filters.category === c.key;
             const Icon = c.icon;
             return (
               <Link
@@ -115,7 +129,7 @@ export function Layout({ children }: { children: ReactNode }) {
           <SectionLabel>Filtry</SectionLabel>
           <Link
             href={filterHref("unread", "1")}
-            className={`flex items-center gap-2 px-2 py-1.5 text-sm rounded-md hover-elevate ${filters.unread ? "bg-sidebar-accent" : ""}`}
+            className={`flex items-center gap-2 px-2 py-1.5 text-sm rounded-md hover-elevate ${location.startsWith("/inbox") && filters.unread ? "bg-sidebar-accent" : ""}`}
             data-testid="link-filter-unread"
           >
             <CircleAlert className="size-4 text-muted-foreground" />
@@ -123,7 +137,7 @@ export function Layout({ children }: { children: ReactNode }) {
           </Link>
           <Link
             href={filterHref("priority", "high")}
-            className={`flex items-center gap-2 px-2 py-1.5 text-sm rounded-md hover-elevate ${filters.priority === "high" ? "bg-sidebar-accent" : ""}`}
+            className={`flex items-center gap-2 px-2 py-1.5 text-sm rounded-md hover-elevate ${location.startsWith("/inbox") && filters.priority === "high" ? "bg-sidebar-accent" : ""}`}
             data-testid="link-filter-priority"
           >
             <AlertTriangle className="size-4 text-muted-foreground" />
@@ -131,7 +145,7 @@ export function Layout({ children }: { children: ReactNode }) {
           </Link>
           <Link
             href={filterHref("attachments", "1")}
-            className={`flex items-center gap-2 px-2 py-1.5 text-sm rounded-md hover-elevate ${filters.attachments ? "bg-sidebar-accent" : ""}`}
+            className={`flex items-center gap-2 px-2 py-1.5 text-sm rounded-md hover-elevate ${location.startsWith("/inbox") && filters.attachments ? "bg-sidebar-accent" : ""}`}
             data-testid="link-filter-attachments"
           >
             <FileText className="size-4 text-muted-foreground" />
@@ -171,7 +185,7 @@ export function Layout({ children }: { children: ReactNode }) {
           {(accounts || []).map((a) => (
             <Link
               key={a.id}
-              href={`/?account_id=${a.id}`}
+              href={`/inbox?account_id=${a.id}`}
               className="flex items-center gap-2 px-2 py-1.5 text-sm rounded-md hover-elevate"
               data-testid={`link-account-${a.id}`}
             >

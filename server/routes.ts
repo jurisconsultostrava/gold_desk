@@ -57,6 +57,45 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // ---------- Strategic Dashboard / řídicí centrum ----------
+  app.get("/api/dashboard/strategic", asyncH(async (_req, res) => {
+    if (!supabaseConfigured()) {
+      return res.json(buildStrategicDashboard([], [], [], [], ["Supabase není nakonfigurované."]));
+    }
+
+    const sb = supabase()!;
+    const warnings: string[] = [];
+
+    const accounts = await safeDashboardQuery(async () => storage.listAccounts(), [], warnings, "Nepodařilo se načíst e-mailové účty.");
+    const threads = await safeDashboardQuery(async () => storage.listThreads({ archived: false }), [], warnings, "Nepodařilo se načíst e-mailová vlákna.");
+
+    const datovkaMessages = await safeDashboardQuery(async () => {
+      const { data, error } = await sb
+        .from("datovka_messages")
+        .select("id,subject,sender_name,delivered_at,priority,deadline_date,deadline_text,summary,submission_type,institution_type,case_number,is_archived")
+        .eq("user_id", config.userId)
+        .eq("is_archived", false)
+        .order("delivered_at", { ascending: false, nullsFirst: false })
+        .limit(100);
+      if (error) throw error;
+      return data || [];
+    }, [], warnings, "Nepodařilo se načíst datovou poštu. Zkontroluj migraci datovky.");
+
+    const communications = await safeDashboardQuery(async () => {
+      const { data, error } = await sb
+        .from("communication_outputs")
+        .select("id,case_id,subject,summary,email_text,review_reply,approval_required,approved,created_at,risk_analysis")
+        .eq("user_id", config.userId)
+        .order("created_at", { ascending: false })
+        .limit(80);
+      if (error) throw error;
+      return data || [];
+    }, [], warnings, "Nepodařilo se načíst historii komunikace.");
+
+    res.json(buildStrategicDashboard(threads as any[], datovkaMessages as any[], communications as any[], accounts as any[], warnings));
+  }));
+
+
   // ---------- AI konfigurace ----------
   app.get("/api/ai/config", (_req, res) => {
     res.json(getAIConfigInfo());
@@ -391,13 +430,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   function isDatovkaLiveSchemaMissing(error: any) {
     const msg = String(error?.message || error?.details || error?.hint || "").toLowerCase();
     return error?.code === "42703"
+      || error?.code === "42P01"
       || error?.code === "PGRST204"
+      || error?.code === "PGRST205"
+      || msg.includes("datovka_mailboxes")
+      || msg.includes("datovka_messages")
       || msg.includes("live_access_enabled")
       || msg.includes("login_enc")
       || msg.includes("password_enc")
       || msg.includes("password_expires_at")
       || msg.includes("schema cache")
-      || msg.includes("could not find the");
+      || msg.includes("could not find the")
+      || msg.includes("does not exist");
   }
 
   function normalizeDatovkaMailbox(row: any, liveSchemaReady = true) {
@@ -485,7 +529,11 @@ create index if not exists idx_datovka_mailboxes_live on public.datovka_mailboxe
         .select(DATOVKA_BASE_COLUMNS)
         .eq("user_id", config.userId)
         .order("created_at", { ascending: true });
-      if (fallback.error) throw fallback.error;
+      if (fallback.error) {
+        console.warn("datovka mailboxes fallback failed:", fallback.error.message || fallback.error);
+        res.setHeader("X-GoldDesk-Warning", "datovka_schema_missing");
+        return res.json([]);
+      }
       return res.json((fallback.data || []).map((row) => normalizeDatovkaMailbox(row, false)));
     }
     throw error;
@@ -1342,6 +1390,222 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, fallbackFactory: 
     if (timer) clearTimeout(timer);
   }
 }
+
+  async function safeDashboardQuery<T>(fn: () => Promise<T>, fallback: T, warnings: string[], warning: string): Promise<T> {
+    try {
+      return await fn();
+    } catch (e: any) {
+      console.warn("dashboard query warning:", warning, e?.message || e);
+      warnings.push(warning);
+      return fallback;
+    }
+  }
+
+  function buildStrategicDashboard(threads: any[], datovkaMessages: any[], communications: any[], accounts: any[], warnings: string[]) {
+    const now = new Date();
+    const items = [
+      ...threads.map((t) => dashboardItemFromThread(t)),
+      ...datovkaMessages.map((m) => dashboardItemFromDatovka(m)),
+      ...communications.map((c) => dashboardItemFromCommunication(c)),
+    ].filter(Boolean) as any[];
+
+    items.sort((a, b) => {
+      const urgencyDiff = (b.urgency_score || 0) - (a.urgency_score || 0);
+      if (urgencyDiff !== 0) return urgencyDiff;
+      return new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime();
+    });
+
+    const latest = [...items].sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime()).slice(0, 12);
+    const focus = items.filter((i) => (i.urgency_score || 0) >= 45 || i.deadline_status === "overdue" || i.deadline_status === "soon").slice(0, 10);
+    const tasks = items
+      .filter((i) => i.recommended_action || i.deadline)
+      .sort((a, b) => {
+        const ad = a.deadline ? new Date(a.deadline).getTime() : Number.POSITIVE_INFINITY;
+        const bd = b.deadline ? new Date(b.deadline).getTime() : Number.POSITIVE_INFINITY;
+        if (ad !== bd) return ad - bd;
+        return (b.urgency_score || 0) - (a.urgency_score || 0);
+      })
+      .slice(0, 12);
+
+    const overdue = items.filter((i) => i.deadline_status === "overdue").length;
+    const dueSoon = items.filter((i) => i.deadline_status === "soon").length;
+    const highRisk = items.filter((i) => i.risk === "critical" || i.risk === "high").length;
+    const pendingApprovals = communications.filter((c) => c.approval_required && !c.approved).length;
+    const unread = threads.filter((t) => !t.is_read).length;
+    const syncing = accounts.filter((a) => a.sync_status === "syncing").length;
+    const syncErrors = accounts.filter((a) => a.sync_status === "error" || a.sync_error).length;
+
+    const strategicNotes = buildStrategicNotes({ accounts, warnings, overdue, dueSoon, highRisk, pendingApprovals, unread, syncErrors });
+
+    return {
+      generated_at: now.toISOString(),
+      warnings,
+      metrics: {
+        total_items: items.length,
+        focus_count: focus.length,
+        latest_count: latest.length,
+        tasks_count: tasks.length,
+        unread,
+        overdue,
+        due_soon: dueSoon,
+        high_risk: highRisk,
+        pending_approvals: pendingApprovals,
+        mail_threads: threads.length,
+        datovka_messages: datovkaMessages.length,
+        communication_outputs: communications.length,
+        accounts: accounts.length,
+        syncing,
+        sync_errors: syncErrors,
+      },
+      focus,
+      latest,
+      tasks,
+      strategic_notes: strategicNotes,
+    };
+  }
+
+  function dashboardItemFromThread(t: any) {
+    const text = `${t.subject || ""}\n${t.summary || ""}\n${(t.key_facts || []).join("\n")}`;
+    const deadline = dashboardExtractDeadline(text);
+    const urgency = dashboardUrgencyScore({ text, priority: t.priority, category: t.category, isRead: t.is_read, deadline });
+    return {
+      id: `mail:${t.id}`,
+      source_type: "mail",
+      source_label: "E-mail",
+      title: t.subject || "(bez předmětu)",
+      subtitle: t.summary || "",
+      actor: (t.participants || [])[0] || "—",
+      date: t.last_message_at || t.created_at || null,
+      category: t.category || "other",
+      urgency_score: urgency.score,
+      urgency_label: urgency.label,
+      risk: urgency.risk,
+      deadline: deadline?.date?.toISOString() || null,
+      deadline_label: deadline?.source || null,
+      deadline_status: dashboardDeadlineStatus(deadline?.date || null),
+      href: `/thread/${t.id}`,
+      recommended_action: urgency.score >= 70 ? "Prověřit a připravit osobní odpověď ještě dnes." : "Zkontrolovat, zda není nutná odpověď nebo úkol.",
+    };
+  }
+
+  function dashboardItemFromDatovka(m: any) {
+    const deadlineDate = m.deadline_date ? new Date(m.deadline_date) : null;
+    const fallbackDeadline = dashboardExtractDeadline(`${m.subject || ""}\n${m.summary || ""}\n${m.deadline_text || ""}`)?.date || null;
+    const deadline = deadlineDate || fallbackDeadline;
+    const text = `${m.subject || ""}\n${m.summary || ""}\n${m.deadline_text || ""}\n${m.case_number || ""}`;
+    const urgency = dashboardUrgencyScore({ text, priority: m.priority, category: m.submission_type, isRead: false, deadline: deadline ? { date: deadline, source: m.deadline_text || m.deadline_date || "termín" } : null });
+    return {
+      id: `datovka:${m.id}`,
+      source_type: "datovka",
+      source_label: "Datovka",
+      title: m.subject || "Datová zpráva",
+      subtitle: m.summary || m.case_number || "",
+      actor: m.sender_name || "Datová schránka",
+      date: m.delivered_at || null,
+      category: m.submission_type || m.institution_type || "other",
+      urgency_score: Math.max(urgency.score, m.priority === "high" ? 85 : 45),
+      urgency_label: urgency.score >= 80 || m.priority === "high" ? "vysoká" : urgency.label,
+      risk: m.priority === "high" ? "high" : urgency.risk,
+      deadline: deadline ? deadline.toISOString() : null,
+      deadline_label: m.deadline_text || m.deadline_date || null,
+      deadline_status: dashboardDeadlineStatus(deadline),
+      href: "/datovka",
+      recommended_action: "Ověřit doručení, lhůtu a připravit procesní/obchodní reakci.",
+    };
+  }
+
+  function dashboardItemFromCommunication(c: any) {
+    const text = `${c.subject || ""}\n${c.summary || ""}\n${c.email_text || ""}\n${c.review_reply || ""}`;
+    const urgency = dashboardUrgencyScore({ text, priority: c.approval_required && !c.approved ? "high" : "normal", category: "communication", isRead: c.approved, deadline: null });
+    return {
+      id: `communication:${c.id}`,
+      source_type: "communication",
+      source_label: "Communicator",
+      title: c.subject || (c.review_reply ? "Reakce na recenzi" : "Návrh komunikace"),
+      subtitle: c.summary || "",
+      actor: c.approval_required && !c.approved ? "Čeká na rozhodnutí" : "Uloženo",
+      date: c.created_at || null,
+      category: c.review_reply ? "review" : "client_reply",
+      urgency_score: c.approval_required && !c.approved ? Math.max(urgency.score, 75) : urgency.score,
+      urgency_label: c.approval_required && !c.approved ? "čeká na schválení" : urgency.label,
+      risk: c.approval_required && !c.approved ? "high" : urgency.risk,
+      deadline: null,
+      deadline_label: null,
+      deadline_status: "none",
+      href: "/communicator",
+      recommended_action: c.approval_required && !c.approved ? "Rozhodnout, upravit a schválit/neschválit finální text." : "Zkontrolovat, zda byl výstup použit a uzavřen.",
+    };
+  }
+
+  function buildStrategicNotes(input: { accounts: any[]; warnings: string[]; overdue: number; dueSoon: number; highRisk: number; pendingApprovals: number; unread: number; syncErrors: number }) {
+    const notes: Array<{ level: "info" | "warning" | "critical"; title: string; body: string }> = [];
+    if (!input.accounts.length) notes.push({ level: "warning", title: "Není připojená žádná e-mailová schránka", body: "Řídicí centrum bez synchronizované pošty neuvidí zanedbané odpovědi ani klientské urgence." });
+    if (input.syncErrors > 0) notes.push({ level: "critical", title: "Chyba synchronizace schránky", body: "Zkontroluj nastavení účtů. Pokud se pošta nestahuje, dashboard nebude úplný." });
+    if (input.overdue > 0) notes.push({ level: "critical", title: "Existují věci po termínu", body: "Nejdřív řeš položky po termínu. U klientské komunikace jde o reputační riziko." });
+    if (input.dueSoon > 0) notes.push({ level: "warning", title: "Blíží se termíny", body: "Položky s termínem dnes/zítra dej do denního plánu a přiřaď odpovědnou osobu." });
+    if (input.highRisk > 0) notes.push({ level: "warning", title: "Riziková komunikace", body: "U právních, AML, refundací a Gold Deposit věcí piš lidsky, ale bez neověřených slibů." });
+    if (input.pendingApprovals > 0) notes.push({ level: "warning", title: "Čekají návrhy odpovědí", body: "Rozhodni, které texty poslat, upravit nebo zahodit. Nedrž klienty v nejistotě." });
+    if (input.warnings.length) notes.push({ level: "warning", title: "Neúplná data dashboardu", body: input.warnings.join(" ") });
+    if (!notes.length) notes.push({ level: "info", title: "Dnes nejsou vidět kritické blokátory", body: "Projdi novinky, připrav odpovědi a udržuj komunikaci aktivní dřív, než klient začne urgovat." });
+    return notes;
+  }
+
+  function dashboardUrgencyScore(input: { text: string; priority?: string | null; category?: string | null; isRead?: boolean; deadline?: { date: Date; source: string } | null }) {
+    const text = (input.text || "").toLowerCase();
+    let score = 10;
+    if (input.priority === "high") score += 55;
+    if (input.priority === "normal") score += 20;
+    if (!input.isRead) score += 10;
+    if (["demand", "lawsuit", "decision", "contract", "gold_deposit"].includes(String(input.category || ""))) score += 20;
+    if (/(urgent|naléhav|ihned|okamžitě|dnes|zítra|termín|lhůta|deadline|poslední výzva)/i.test(text)) score += 25;
+    if (/(advokát|předžalob|žalob|soud|policie|čnb|faú|banka|aml|reklamac|stížnost|refund|vrácení peněz|gold deposit|deponovan|odměn|výnos|poškození pověsti|recenze)/i.test(text)) score += 35;
+    const status = dashboardDeadlineStatus(input.deadline?.date || null);
+    if (status === "overdue") score += 45;
+    if (status === "soon") score += 30;
+    if (score >= 95) return { score, label: "kritická", risk: "critical" };
+    if (score >= 65) return { score, label: "vysoká", risk: "high" };
+    if (score >= 35) return { score, label: "střední", risk: "medium" };
+    return { score, label: "nízká", risk: "low" };
+  }
+
+  function dashboardDeadlineStatus(date: Date | null): "none" | "overdue" | "soon" | "planned" {
+    if (!date || Number.isNaN(date.getTime())) return "none";
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const days = Math.ceil((date.getTime() - today) / 86_400_000);
+    if (days < 0) return "overdue";
+    if (days <= 2) return "soon";
+    return "planned";
+  }
+
+  function dashboardExtractDeadline(text: string): { date: Date; source: string } | null {
+    const normalized = String(text || "").replace(/\s+/g, " ").trim();
+    if (!normalized) return null;
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const lower = normalized.toLowerCase();
+    if (/\b(dnes|dneška)\b/i.test(lower)) return { date: today, source: "dnes" };
+    if (/\b(zítra|zitra)\b/i.test(lower)) return { date: dashboardAddDays(today, 1), source: "zítra" };
+    if (/\b(pozítří|pozitri)\b/i.test(lower)) return { date: dashboardAddDays(today, 2), source: "pozítří" };
+    const iso = normalized.match(/\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/);
+    if (iso) return { date: new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3])), source: iso[0] };
+    const cz = normalized.match(/\b(\d{1,2})\.\s*(\d{1,2})\.(?:\s*(20\d{2}))?\b/);
+    if (cz) {
+      const year = cz[3] ? Number(cz[3]) : now.getFullYear();
+      let date = new Date(year, Number(cz[2]) - 1, Number(cz[1]));
+      if (!cz[3] && date.getTime() < today.getTime() - 14 * 86_400_000) date = new Date(year + 1, Number(cz[2]) - 1, Number(cz[1]));
+      return { date, source: cz[0] };
+    }
+    const rel = normalized.match(/\bdo\s+(\d{1,2})\s+(dnů|dnu|dní|dni)\b/i);
+    if (rel) return { date: dashboardAddDays(today, Number(rel[1])), source: rel[0] };
+    return null;
+  }
+
+  function dashboardAddDays(date: Date, days: number) {
+    const d = new Date(date);
+    d.setDate(d.getDate() + days);
+    return d;
+  }
 
   return httpServer;
 }

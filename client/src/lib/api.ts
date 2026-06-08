@@ -15,6 +15,36 @@ export interface ThreadDetailResponse extends Thread {
 }
 
 
+
+export interface StrategicDashboardItem {
+  id: string;
+  source_type: "mail" | "datovka" | "communication" | string;
+  source_label: string;
+  title: string;
+  subtitle?: string;
+  actor?: string;
+  date?: string | null;
+  category?: string;
+  urgency_score: number;
+  urgency_label: string;
+  risk: "low" | "medium" | "high" | "critical" | string;
+  deadline?: string | null;
+  deadline_label?: string | null;
+  deadline_status: "none" | "overdue" | "soon" | "planned" | string;
+  href: string;
+  recommended_action?: string;
+}
+
+export interface StrategicDashboardResponse {
+  generated_at: string;
+  warnings: string[];
+  metrics: Record<string, number>;
+  focus: StrategicDashboardItem[];
+  latest: StrategicDashboardItem[];
+  tasks: StrategicDashboardItem[];
+  strategic_notes: Array<{ level: "info" | "warning" | "critical"; title: string; body: string }>;
+}
+
 export interface AppAuthMe {
   auth_enabled: boolean;
   authenticated: boolean;
@@ -136,6 +166,11 @@ async function apiFormData(url: string, data: FormData): Promise<Response> {
 }
 
 export const api = {
+
+  async strategicDashboard(): Promise<StrategicDashboardResponse> {
+    const r = await apiRequest("GET", "/api/dashboard/strategic");
+    return r.json();
+  },
 
   async authMe(): Promise<AppAuthMe> {
     const r = await apiRequest("GET", "/api/app-auth/me");

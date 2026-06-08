@@ -11,9 +11,9 @@ import { CategoryTabs } from "@/components/CategoryTabs";
 
 // Filtry kategorií/účtu čteme z window.location.search — wouter hash routing
 // drží nás na path "/" a search params žijí v `window.location.search`.
-function parseFilters(_loc: string) {
-  if (typeof window === "undefined") return {};
-  const sp = new URLSearchParams(window.location.search);
+function parseFilters(loc: string) {
+  const query = loc.includes("?") ? loc.slice(loc.indexOf("?") + 1) : (typeof window !== "undefined" ? window.location.search.replace(/^\?/, "") : "");
+  const sp = new URLSearchParams(query);
   return {
     category: sp.get("category") || undefined,
     unread: sp.get("unread") === "1" ? "1" : undefined,
@@ -28,14 +28,14 @@ type SortDir = "asc" | "desc";
 
 function setSearchParam(key: string, value: string | undefined) {
   if (typeof window === "undefined") return;
-  const sp = new URLSearchParams(window.location.search);
+  const hash = window.location.hash.replace(/^#/, "") || "/inbox";
+  const [path, query = ""] = hash.split("?");
+  const sp = new URLSearchParams(query);
   if (!value) sp.delete(key);
   else sp.set(key, value);
   const qs = sp.toString();
-  const newUrl = window.location.pathname + (qs ? "?" + qs : "") + window.location.hash;
-  window.history.pushState({}, "", newUrl);
-  // Notify wouter (and our own listener) that the URL changed.
-  window.dispatchEvent(new PopStateEvent("popstate"));
+  window.location.hash = `${path || "/inbox"}${qs ? "?" + qs : ""}`;
+  window.dispatchEvent(new HashChangeEvent("hashchange"));
 }
 
 export default function Inbox() {
