@@ -14,6 +14,13 @@ export interface ThreadDetailResponse extends Thread {
   actions: Action[];
 }
 
+
+export interface AppAuthMe {
+  auth_enabled: boolean;
+  authenticated: boolean;
+  username: string | null;
+}
+
 export interface AIProviderInfo {
   configured: boolean;
   models: string[];
@@ -115,7 +122,7 @@ export interface CommunicatorDocumentAnalysis {
 
 async function apiFormData(url: string, data: FormData): Promise<Response> {
   const apiBase = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
-  const res = await fetch(`${apiBase}${url}`, { method: "POST", body: data });
+  const res = await fetch(`${apiBase}${url}`, { method: "POST", body: data, credentials: "include" });
   if (!res.ok) {
     const text = (await res.text()) || res.statusText;
     throw new Error(`${res.status}: ${text}`);
@@ -124,6 +131,19 @@ async function apiFormData(url: string, data: FormData): Promise<Response> {
 }
 
 export const api = {
+
+  async authMe(): Promise<AppAuthMe> {
+    const r = await apiRequest("GET", "/api/app-auth/me");
+    return r.json();
+  },
+  async authLogin(username: string, password: string): Promise<AppAuthMe & { ok: boolean }> {
+    const r = await apiRequest("POST", "/api/app-auth/login", { username, password });
+    return r.json();
+  },
+  async authLogout(): Promise<{ ok: boolean }> {
+    const r = await apiRequest("POST", "/api/app-auth/logout", {});
+    return r.json();
+  },
 
   async communicatorAnalyzeDocument(data: FormData): Promise<CommunicatorDocumentAnalysis> {
     const r = await apiFormData("/api/communicator/analyze-document", data);

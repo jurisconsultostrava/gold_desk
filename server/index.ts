@@ -4,6 +4,7 @@ import type { Request } from 'express';
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
+import { setupAppAuth } from "./auth";
 
 const app = express();
 const httpServer = createServer(app);
@@ -23,6 +24,8 @@ app.use(
 );
 
 app.use(express.urlencoded({ extended: false }));
+
+setupAppAuth(app);
 
 export function log(message: string, source = "express") {
   const formattedTime = new Date().toLocaleTimeString("en-US", {

@@ -34,6 +34,7 @@ import { aiConfigured, draftReply, documentQA, getAIConfigInfo } from "./ai";
 import { BUILTIN_COMMUNICATION_TEMPLATES, analyzeCommunicationDocument, communicationGenerateSchema, generateCommunication } from "./communicator";
 import { extractText } from "./extract";
 import { anthropicConfigured, openaiConfigured, perplexityConfigured, geminiConfigured } from "./config";
+import { appAuthEnabled, appAuthConfigured } from "./auth";
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   // ---------- Health / config status ----------
@@ -45,6 +46,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       outlook: outlookConfigured(),
       gmail: gmailConfigured(),
       databox_bridge: true,
+      auth: { enabled: appAuthEnabled(), configured: appAuthConfigured() },
       ai: aiConfigured(),
       gemini: geminiConfigured(),
       anthropic: anthropicConfigured(),
@@ -897,7 +899,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   const communicatorUpload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 25 * 1024 * 1024, files: 1 },
+    limits: {
+      fileSize: Number(process.env.COMMUNICATOR_UPLOAD_MAX_BYTES || 25 * 1024 * 1024),
+      fieldSize: Number(process.env.COMMUNICATOR_FIELD_MAX_BYTES || 10 * 1024 * 1024),
+      files: 1,
+      fields: 20,
+    },
   });
 
   app.post("/api/communicator/analyze-document", communicatorUpload.single("file"), asyncH(async (req, res) => {
@@ -938,8 +945,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return res.status(422).json({ message: "Z dokumentu se nepodařilo získat použitelný text. U skenovaného PDF zkontroluj kvalitu nebo vlož text ručně." });
     }
 
-    const analysis = await analyzeCommunicationDocument({ filename, mimeType, text: extractedText, modeHint, provider, model });
     const sourceText = extractedText.slice(0, 24000);
+    const analysis = await withTimeout(
+      analyzeCommunicationDocument({ filename, mimeType, text: sourceText, modeHint, provider, model }),
+      Number(process.env.COMMUNICATOR_ANALYSIS_TIMEOUT_MS || 30000),
+      () => fallbackAnalyzeDocument(sourceText, filename, mimeType, modeHint),
+    );
     const formPatch = {
       mode: analysis.mode,
       client_name: analysis.client_name || "",
@@ -1070,6 +1081,62 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     res.status(201).json({ case: commCase, output: commOutput });
   }));
+
+function fallbackAnalyzeDocument(text: string, filename: string, mimeType: string, modeHint: "client" | "review" | "auto") {
+  const lower = `${filename}\n${text}`.toLowerCase();
+  const looksReview = modeHint === "review" || /(google|heureka|firmy\.cz|recenz|hvězd|stars?|★|⭐)/i.test(text.slice(0, 5000));
+  const critical = /(advokát|předžalob|žalob|policie|čnb|faú|banka|aml|trestn|zpronevěr)/i.test(lower);
+  const high = /(refund|vrácení peněz|odměn|výnos|deponovan|gold deposit|custody|nedodán|prodlen|reklamac|stížnost)/i.test(lower);
+  const situation = /(advokát|předžalob|žalob)/i.test(lower) ? "legal_notice"
+    : /(aml|identifikac|faú)/i.test(lower) ? "aml"
+    : /(refund|vrácení peněz|storno)/i.test(lower) ? "refund"
+    : /(deponovan|gold deposit|odměn|výnos)/i.test(lower) ? "gold_deposit"
+    : /(nedodán|dodání|zdrž|skladem|objednávk)/i.test(lower) ? "delivery_delay"
+    : looksReview ? "review_negative"
+    : /(reklamac|stížnost|nespokojen)/i.test(lower) ? "complaint"
+    : "general";
+  const email = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] || "";
+  const excerpt = text.replace(/\s+/g, " ").trim().slice(0, 1800);
+  return {
+    mode: looksReview ? "review" : "client",
+    client_name: "",
+    client_email: email,
+    product_type: /(deponovan|gold deposit|gold pool)/i.test(lower) ? "Gold Deposit" : "Investiční zlato",
+    situation_type: situation,
+    client_message: looksReview ? "" : excerpt,
+    review_platform: /heureka/i.test(lower) ? "Heureka" : /firmy/i.test(lower) ? "Firmy.cz" : /google/i.test(lower) ? "Google" : "Import dokumentu",
+    review_rating: text.match(/([1-5]\s*(?:\/\s*5|hvězdič(?:ek|ky|ka)?|stars?))|([★⭐]{1,5})/i)?.[0] || "",
+    review_text: looksReview ? excerpt : "",
+    what_happened: excerpt,
+    what_we_know: "Automaticky extrahováno z dokumentu. Před odesláním ověřit fakta proti smlouvám, objednávce a interní evidenci.",
+    what_we_do_not_know: "Přesný právní stav, aktuální stav plnění, stav platby/kovu a ověřený termín dalšího kroku.",
+    what_we_can_promise: "Lze slíbit pouze prověření věci a konkrétní následný kontakt v ověřeném termínu.",
+    what_we_must_not_promise: "Neslibovat neověřený termín, výplatu, refundaci, právní nárok, uznání dluhu ani porušení smlouvy bez schválení.",
+    tone: looksReview ? "public_safe" : (critical ? "legally_cautious" : "human_apology"),
+    risk_level: critical ? "critical" : high ? "high" : "medium",
+    extra_instructions: "AI analýza vypršela nebo selhala; formulář byl předvyplněn nouzovou lokální analýzou.",
+    summary: excerpt || `Dokument ${filename} (${mimeType}) byl načten, ale bez spolehlivého shrnutí.`,
+    extracted_facts: excerpt ? [excerpt] : [],
+    missing_information: ["Ověřit identitu klienta", "Ověřit smlouvu/objednávku", "Ověřit aktuální stav plnění", "Ověřit, co již bylo klientovi slíbeno"],
+    risks: critical ? ["Možná právní nebo institucionální komunikace", "Vyžaduje právní/management schválení"] : ["Automatická extrakce může být neúplná", "Před odesláním ověřit fakta"],
+    suggested_action: "Nejdříve ověřit fakta v interní evidenci, poté použít bezpečnou odpověď bez neověřených slibů.",
+    confidence: text.trim().length > 400 ? "medium" : "low",
+  };
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, fallbackFactory: () => any): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallbackFactory() as T), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
   return httpServer;
 }

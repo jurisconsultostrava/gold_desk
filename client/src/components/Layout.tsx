@@ -17,6 +17,7 @@ import {
   Sun,
   MailOpen,
   MessageSquareText,
+  LogOut,
 } from "lucide-react";
 import type { Account } from "@shared/schema";
 
@@ -76,6 +77,12 @@ export function Layout({ children }: { children: ReactNode }) {
     if (filters.category) sp.set("category", filters.category);
     sp.set(key, val);
     return "/?" + sp.toString();
+  }
+
+
+  async function logout() {
+    await api.authLogout();
+    window.location.reload();
   }
 
   return (
@@ -196,6 +203,15 @@ export function Layout({ children }: { children: ReactNode }) {
             data-testid="button-toggle-theme"
           >
             {dark ? <Sun className="size-4" /> : <Moon className="size-4" />}
+          </button>
+          <button
+            onClick={logout}
+            className="p-1.5 rounded-md hover-elevate"
+            aria-label="Odhlásit se"
+            title="Odhlásit se"
+            data-testid="button-logout"
+          >
+            <LogOut className="size-4" />
           </button>
         </div>
       </aside>

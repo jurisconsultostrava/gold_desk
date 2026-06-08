@@ -3,6 +3,11 @@
 
 const OCR_THRESHOLD = 100; // <100 chars from pdf-parse → likely scanned
 
+function ocrEnabled(): boolean {
+  const raw = String(process.env.ENABLE_OCR || "").toLowerCase();
+  return raw === "true" || raw === "1" || raw === "on";
+}
+
 export async function extractText(
   filename: string,
   mime: string,
@@ -12,8 +17,9 @@ export async function extractText(
   try {
     if (lower.endsWith(".pdf") || (mime || "").includes("pdf")) {
       const text = await extractPdf(buf);
-      if (text.trim().length < OCR_THRESHOLD) {
-        // probably a scanned PDF — try OCR
+      if (text.trim().length < OCR_THRESHOLD && ocrEnabled()) {
+        // probably a scanned PDF — try OCR only when explicitly enabled.
+        // OCR is CPU/RAM heavy and can cause Railway 502/timeouts on small instances.
         const ocr = await runOcr(buf, mime || "application/pdf").catch(() => "");
         if (ocr.length > text.length) return { text: ocr, ocrUsed: true };
       }
@@ -36,6 +42,7 @@ export async function extractText(
       lower.endsWith(".jpeg") ||
       (mime || "").startsWith("image/")
     ) {
+      if (!ocrEnabled()) return { text: "", ocrUsed: false };
       const ocr = await runOcr(buf, mime || "image/png").catch(() => "");
       return { text: ocr, ocrUsed: !!ocr };
     }

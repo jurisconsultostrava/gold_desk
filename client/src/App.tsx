@@ -12,6 +12,7 @@ import Accounts from "@/pages/Accounts";
 import Datovka from "@/pages/Datovka";
 import Communicator from "@/pages/Communicator";
 import { Layout } from "@/components/Layout";
+import { AuthGate } from "@/components/AuthGate";
 
 function AppRouter() {
   return (
@@ -32,11 +33,13 @@ function App() {
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <Toaster />
-        <Router hook={useHashLocation}>
-          <Layout>
-            <AppRouter />
-          </Layout>
-        </Router>
+        <AuthGate>
+          <Router hook={useHashLocation}>
+            <Layout>
+              <AppRouter />
+            </Layout>
+          </Router>
+        </AuthGate>
       </TooltipProvider>
     </QueryClientProvider>
   );
