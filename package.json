@@ -9,7 +9,8 @@
     "start": "NODE_ENV=production node dist/index.cjs",
     "check": "tsc --noEmit",
     "db:push": "echo \"This project uses Supabase SQL migrations. Run migration.sql in Supabase SQL Editor.\"",
-    "railway:build": "npm ci --no-audit --no-fund && npm run build"
+    "railway:build": "npm ci --no-audit --no-fund && npm run build",
+    "auth:hash": "node scripts/hash-password.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.95.1",
