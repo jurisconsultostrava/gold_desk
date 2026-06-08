@@ -1043,100 +1043,124 @@ create index if not exists idx_datovka_mailboxes_live on public.datovka_mailboxe
     },
   });
 
-  app.post("/api/communicator/analyze-document", communicatorUpload.single("file"), asyncH(async (req, res) => {
-    const file = req.file;
-    const pasted = typeof req.body?.html_text === "string" ? req.body.html_text : "";
-    const modeHintRaw = String(req.body?.mode_hint || "auto");
-    const modeHint = modeHintRaw === "client" || modeHintRaw === "review" ? modeHintRaw : "auto";
-    const provider = req.body?.provider ? String(req.body.provider) : undefined;
-    const model = req.body?.model ? String(req.body.model) : undefined;
+  app.post(
+    "/api/communicator/analyze-document",
+    (req, res, next) => {
+      communicatorUpload.single("file")(req, res, (err: any) => {
+        if (!err) return next();
+        const code = err?.code === "LIMIT_FILE_SIZE" ? 413 : 400;
+        return res.status(code).json({
+          ok: false,
+          message: err?.code === "LIMIT_FILE_SIZE"
+            ? "Soubor je příliš velký. Zmenši PDF/HTML nebo zvyš COMMUNICATOR_UPLOAD_MAX_BYTES."
+            : `Upload dokumentu selhal: ${err?.message || err}`,
+          code: err?.code || "UPLOAD_ERROR",
+        });
+      });
+    },
+    asyncH(async (req, res) => {
+      try {
+        const file = req.file;
+        const pasted = typeof req.body?.html_text === "string" ? req.body.html_text : "";
+        const modeHintRaw = String(req.body?.mode_hint || "auto");
+        const modeHint = modeHintRaw === "client" || modeHintRaw === "review" ? modeHintRaw : "auto";
+        const provider = req.body?.provider ? String(req.body.provider) : undefined;
+        const model = req.body?.model ? String(req.body.model) : undefined;
 
-    let extractedText = "";
-    let ocrUsed = false;
-    let filename = "vlozeny-dokument.txt";
-    let mimeType = "text/plain";
+        let extractedText = "";
+        let ocrUsed = false;
+        let extractionWarning = "";
+        let filename = "vlozeny-dokument.txt";
+        let mimeType = "text/plain";
 
-    if (file) {
-      filename = file.originalname || filename;
-      mimeType = file.mimetype || guessMime(filename);
-      if (isHtml(filename, mimeType)) {
-        extractedText = htmlToPlainText(file.buffer.toString("utf8"));
-      } else if (isPlainText(filename, mimeType)) {
-        extractedText = file.buffer.toString("utf8");
-      } else {
-        const extracted = await extractText(filename, mimeType, file.buffer);
-        extractedText = extracted.text;
-        ocrUsed = extracted.ocrUsed;
+        if (file) {
+          filename = file.originalname || filename;
+          mimeType = file.mimetype || guessMime(filename);
+          try {
+            if (isHtml(filename, mimeType)) {
+              extractedText = htmlToPlainText(file.buffer.toString("utf8"));
+            } else if (isPlainText(filename, mimeType)) {
+              extractedText = file.buffer.toString("utf8");
+            } else {
+              const extracted = await withTimeout(
+                extractText(filename, mimeType, file.buffer),
+                Number(process.env.DOCUMENT_EXTRACT_TIMEOUT_MS || 20000),
+                () => ({ text: "", ocrUsed: false }),
+              );
+              extractedText = extracted.text;
+              ocrUsed = extracted.ocrUsed;
+              if (!extractedText) extractionWarning = "PDF/DOC extrakce nevrátila čitelný text. Používám bezpečný fallback bez pádu serveru.";
+            }
+          } catch (e: any) {
+            extractionWarning = `Extrakce dokumentu selhala: ${e?.message || e}`;
+            extractedText = "";
+          }
+        } else if (pasted.trim()) {
+          filename = "vlozeny-html-nebo-text.html";
+          mimeType = "text/html";
+          extractedText = looksLikeHtml(pasted) ? htmlToPlainText(pasted) : pasted;
+        } else {
+          return res.status(400).json({ ok: false, message: "Nahraj PDF/HTML/TXT soubor nebo vlož HTML/text dokumentu." });
+        }
+
+        extractedText = normalizeExtractedText(extractedText);
+        if (!extractedText || extractedText.length < 20) {
+          const sourceText = `${filename}\n${extractionWarning || "Z dokumentu se nepodařilo získat použitelný text."}`;
+          const analysis = fallbackAnalyzeDocument(sourceText, filename, mimeType, modeHint);
+          return res.status(200).json({
+            ok: true,
+            degraded: true,
+            warning: extractionWarning || "Z dokumentu se nepodařilo získat použitelný text. Pokud jde o skenované PDF, vlož text ručně nebo zapni OCR až na silnějším hostingu.",
+            filename,
+            mime_type: mimeType,
+            ocr_used: ocrUsed,
+            extracted_text: "",
+            text_preview: "",
+            form_patch: buildFormPatchFromAnalysis(analysis, filename, mimeType, ""),
+            analysis: buildAnalysisPayload(analysis),
+          });
+        }
+
+        const sourceText = extractedText.slice(0, Number(process.env.COMMUNICATOR_SOURCE_TEXT_MAX_CHARS || 24000));
+        const analysis = await withTimeout(
+          analyzeCommunicationDocument({ filename, mimeType, text: sourceText, modeHint, provider, model }),
+          Number(process.env.COMMUNICATOR_ANALYSIS_TIMEOUT_MS || 30000),
+          () => fallbackAnalyzeDocument(sourceText, filename, mimeType, modeHint),
+        );
+
+        res.json({
+          ok: true,
+          degraded: !!extractionWarning,
+          warning: extractionWarning || undefined,
+          filename,
+          mime_type: mimeType,
+          ocr_used: ocrUsed,
+          extracted_text: sourceText,
+          text_preview: extractedText.slice(0, 2500),
+          form_patch: buildFormPatchFromAnalysis(analysis, filename, mimeType, sourceText),
+          analysis: buildAnalysisPayload(analysis),
+        });
+      } catch (e: any) {
+        console.error("analyze-document hard fallback:", e?.stack || e?.message || e);
+        const filename = "nezpracovany-dokument";
+        const mimeType = "application/octet-stream";
+        const sourceText = `Analýza dokumentu selhala technickou chybou: ${e?.message || e}`;
+        const analysis = fallbackAnalyzeDocument(sourceText, filename, mimeType, "auto");
+        return res.status(200).json({
+          ok: true,
+          degraded: true,
+          warning: "Analýza dokumentu spadla do nouzového režimu. Server nespadl; vlož prosím text ručně nebo zkus menší PDF.",
+          filename,
+          mime_type: mimeType,
+          ocr_used: false,
+          extracted_text: "",
+          text_preview: "",
+          form_patch: buildFormPatchFromAnalysis(analysis, filename, mimeType, ""),
+          analysis: buildAnalysisPayload(analysis),
+        });
       }
-    } else if (pasted.trim()) {
-      filename = "vlozeny-html-nebo-text.html";
-      mimeType = "text/html";
-      extractedText = looksLikeHtml(pasted) ? htmlToPlainText(pasted) : pasted;
-    } else {
-      return res.status(400).json({ message: "Nahraj PDF/HTML/TXT soubor nebo vlož HTML/text dokumentu." });
-    }
-
-    extractedText = normalizeExtractedText(extractedText);
-    if (!extractedText || extractedText.length < 20) {
-      return res.status(422).json({ message: "Z dokumentu se nepodařilo získat použitelný text. U skenovaného PDF zkontroluj kvalitu nebo vlož text ručně." });
-    }
-
-    const sourceText = extractedText.slice(0, 24000);
-    const analysis = await withTimeout(
-      analyzeCommunicationDocument({ filename, mimeType, text: sourceText, modeHint, provider, model }),
-      Number(process.env.COMMUNICATOR_ANALYSIS_TIMEOUT_MS || 30000),
-      () => fallbackAnalyzeDocument(sourceText, filename, mimeType, modeHint),
-    );
-    const formPatch = {
-      mode: analysis.mode,
-      client_name: analysis.client_name || "",
-      client_email: analysis.client_email || "",
-      product_type: analysis.product_type || "Investiční zlato",
-      situation_type: analysis.situation_type || (analysis.mode === "review" ? "review_negative" : "general"),
-      client_message: analysis.client_message || "",
-      review_platform: analysis.review_platform || "",
-      review_rating: analysis.review_rating || "",
-      review_text: analysis.review_text || "",
-      what_happened: analysis.what_happened || "",
-      what_we_know: analysis.what_we_know || "",
-      what_we_do_not_know: analysis.what_we_do_not_know || "",
-      what_we_can_promise: analysis.what_we_can_promise || "",
-      what_we_must_not_promise: analysis.what_we_must_not_promise || "",
-      tone: analysis.tone || (analysis.mode === "review" ? "public_safe" : "legally_cautious"),
-      risk_level: analysis.risk_level || "medium",
-      extra_instructions: analysis.extra_instructions || "",
-      source_document_name: filename,
-      source_document_type: mimeType,
-      source_document_summary: analysis.summary || "",
-      source_document_text: sourceText,
-      desired_output_types: {
-        email: analysis.mode === "client",
-        sms: analysis.mode === "client",
-        whatsapp: analysis.mode === "client",
-        phone_script: analysis.mode === "client",
-        internal_note: true,
-        html: true,
-      },
-    };
-
-    res.json({
-      ok: true,
-      filename,
-      mime_type: mimeType,
-      ocr_used: ocrUsed,
-      extracted_text: sourceText,
-      text_preview: extractedText.slice(0, 2500),
-      form_patch: formPatch,
-      analysis: {
-        summary: analysis.summary,
-        extracted_facts: analysis.extracted_facts || [],
-        missing_information: analysis.missing_information || [],
-        risks: analysis.risks || [],
-        suggested_action: analysis.suggested_action || "",
-        confidence: analysis.confidence || "medium",
-      },
-    });
-  }));
+    })
+  );
 
   app.post("/api/communicator/generate", asyncH(async (req, res) => {
     const parsed = communicationGenerateSchema.parse(req.body || {});
@@ -1217,6 +1241,51 @@ create index if not exists idx_datovka_mailboxes_live on public.datovka_mailboxe
 
     res.status(201).json({ case: commCase, output: commOutput });
   }));
+
+function buildFormPatchFromAnalysis(analysis: any, filename: string, mimeType: string, sourceText: string) {
+  return {
+    mode: analysis.mode || "client",
+    client_name: analysis.client_name || "",
+    client_email: analysis.client_email || "",
+    product_type: analysis.product_type || "Investiční zlato",
+    situation_type: analysis.situation_type || (analysis.mode === "review" ? "review_negative" : "general"),
+    client_message: analysis.client_message || "",
+    review_platform: analysis.review_platform || "",
+    review_rating: analysis.review_rating || "",
+    review_text: analysis.review_text || "",
+    what_happened: analysis.what_happened || "",
+    what_we_know: analysis.what_we_know || "",
+    what_we_do_not_know: analysis.what_we_do_not_know || "",
+    what_we_can_promise: analysis.what_we_can_promise || "",
+    what_we_must_not_promise: analysis.what_we_must_not_promise || "",
+    tone: analysis.tone || (analysis.mode === "review" ? "public_safe" : "legally_cautious"),
+    risk_level: analysis.risk_level || "medium",
+    extra_instructions: analysis.extra_instructions || "",
+    source_document_name: filename,
+    source_document_type: mimeType,
+    source_document_summary: analysis.summary || "",
+    source_document_text: sourceText,
+    desired_output_types: {
+      email: analysis.mode !== "review",
+      sms: analysis.mode !== "review",
+      whatsapp: analysis.mode !== "review",
+      phone_script: analysis.mode !== "review",
+      internal_note: true,
+      html: true,
+    },
+  };
+}
+
+function buildAnalysisPayload(analysis: any) {
+  return {
+    summary: analysis.summary || "",
+    extracted_facts: analysis.extracted_facts || [],
+    missing_information: analysis.missing_information || [],
+    risks: analysis.risks || [],
+    suggested_action: analysis.suggested_action || "",
+    confidence: analysis.confidence || "medium",
+  };
+}
 
 function fallbackAnalyzeDocument(text: string, filename: string, mimeType: string, modeHint: "client" | "review" | "auto") {
   const lower = `${filename}\n${text}`.toLowerCase();
