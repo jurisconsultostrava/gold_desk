@@ -444,3 +444,9 @@ APP_COOKIE_SECURE=false
 
 Na Railway/HTTPS ponech `APP_COOKIE_SECURE=true`.
 
+
+## GoldDesk Owner Mode + tabulka pošty
+
+Aktuální verze obsahuje upravený Communicator pro majitelský režim: odpovědi mají být méně umělé, více lidské a obchodně zaměřené na udržení zákazníka, obnovení důvěry a ochranu značky. Riziková kontrola je poradenská, nikoliv blokující.
+
+Inbox je nově zobrazen jako tabulka, kterou lze řadit podle data, naléhavosti a odhadnutých termínů. Viz `GOLDDESK_OWNER_MODE_AND_MAIL_TABLE.md`.
