@@ -18,6 +18,7 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -250,6 +251,9 @@ function MailboxesDialog({ open, onClose }: { open: boolean; onClose: () => void
       <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Správa datových schránek</DialogTitle>
+          <DialogDescription>
+            Přidej datovou schránku, nastav online ISDS přístup a spusť test nebo synchronizaci.
+          </DialogDescription>
         </DialogHeader>
         <div className="space-y-3 mt-2">
           <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:bg-amber-950/30 dark:border-amber-900 dark:text-amber-200">
@@ -479,6 +483,9 @@ function UploadDialog({
       <DialogContent className="max-w-md">
         <DialogHeader>
           <DialogTitle>Nahrát ZFO / PDF</DialogTitle>
+          <DialogDescription>
+            Nahraj zprávy nebo dokumenty z datové schránky pro vytěžení a AI analýzu.
+          </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 mt-2">
           {/* Dropzone */}

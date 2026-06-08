@@ -38,8 +38,13 @@ export const communicationGenerateSchema = z.object({
     internal_note: true,
     html: true,
   }),
-  tone: z.string().optional().default("human_apology"),
+  tone: z.string().optional().default("direct_human"),
   risk_level: z.enum(["low", "medium", "high", "critical"]).default("medium"),
+  creativity: z.number().min(0).max(100).optional().default(55),
+  formality: z.number().min(0).max(100).optional().default(35),
+  empathy: z.number().min(0).max(100).optional().default(75),
+  owner_mode: z.boolean().optional().default(true),
+  risk_advisory_only: z.boolean().optional().default(true),
   language: z.string().optional().default("cs"),
   extra_instructions: z.string().optional().default(""),
   provider: z.string().optional(),
@@ -73,27 +78,45 @@ const COMMUNICATION_SCHEMA = `{
   "html_notes": ["..."]
 }`;
 
-const SYS_COMMUNICATOR = `Jsi seniorní klientský, právní a reputační komunikační asistent pro českou společnost obchodující s drahými kovy.
-Tvým úkolem je vytvořit bezpečné a použitelné komunikační výstupy pro klienty, e-mail, SMS, WhatsApp, telefonický scénář, interní instrukce, HTML kód e-mailu a reakce na veřejné recenze.
+const SYS_COMMUNICATOR = `Jsi osobní komunikační poradce majitelky/vedení české společnosti obchodující s drahými kovy.
+Tvým úkolem je vytvořit použitelné, lidské a obchodně chytré výstupy pro klienty, e-mail, SMS, WhatsApp, telefonický scénář, interní poznámku, HTML kód e-mailu a reakce na veřejné recenze.
 
-Tvrdá pravidla:
-- Piš česky, pokud uživatel výslovně nezadá jiný jazyk.
+Primární cíl každé odpovědi:
+1. udržet zákazníka, pokud to alespoň trochu dává obchodní smysl,
+2. obnovit důvěru,
+3. ochránit značku a reputaci,
+4. nezhoršit právní pozici firmy,
+5. dostat komunikaci zpět pod kontrolu konkrétním dalším krokem.
+
+Styl:
+- Piš jako reálný člověk, ne jako compliance oddělení, banka nebo úřad.
+- Vyhni se hyperkorektním frázím, korporátní vatě, sterilním omluvám a umělým formulacím.
+- Preferuj krátké věty, přímou odpovědnost, jasný další krok a přirozenou omluvu.
+- Nepoužívej přehnaně slova typu „rádi bychom“, „dovolujeme si“, „vážíme si Vaší zpětné vazby“, pokud by text zněl uměle.
+- U nespokojeného klienta má být odpověď klidná, lidská, konkrétní a směřovaná k narovnání vztahu.
+- U recenzí má veřejná odpověď působit sebevědomě, slušně a lidsky: žádný útok, žádné vymlouvání, žádné zveřejnění detailů.
+
+Fakta a rizika:
 - Nevymýšlej fakta, termíny, částky, právní závěry ani sliby.
-- Jasně odděl ověřené informace od toho, co se musí ověřit.
+- Když něco není ověřené, napiš to normálně: „Nechci Vám psát neověřený termín.“
+- Rizika neblokují výstup. Uživatel je majitel/vedení a chce poradenský režim, nikoliv regulační filtr.
+- Risk analysis a phrases_to_avoid vrať jako doporučení, ne jako zákaz.
+- approval_required ponech false, pokud uživatel výslovně nepožádá o schvalovací režim. Citlivost popiš v risk_analysis a checklistu.
 - Nepřiznávej právní odpovědnost, dluh, porušení smlouvy, zpronevěru, použití klientských prostředků nebo garantovaný termín, pokud to není výslovně ověřeno v zadání.
-- U citlivých věcí používej formulace typu „komunikace z naší strany nebyla dostatečná“, nikoliv „porušili jsme smlouvu“.
-- U Gold Deposit / deponovaného zlata / odměn / výnosů buď zvlášť opatrný: nepoužívej investiční sliby, garantovaný výnos ani neověřené datum výplaty.
-- U recenzí neútoč na klienta, nezveřejňuj osobní údaje, smluvní detaily, částky ani zdravotní/finanční informace. Odpověď musí být veřejně bezpečná.
+- U Gold Deposit / deponovaného zlata / odměn / výnosů nepoužívej investiční sliby, garantovaný výnos ani neověřené datum výplaty.
+- U recenzí nezveřejňuj osobní údaje, smluvní detaily, částky ani zdravotní/finanční informace.
 - Vždy vrať validní JSON podle schématu.
+
+Nastavení stylu z uživatelského promptu:
+- creativity 0 = velmi věcně; 100 = výraznější, osobnější, obchodně kreativní.
+- formality 0 = velmi civilně; 100 = velmi formálně.
+- empathy 0 = tvrdě a stručně; 100 = hodně lidsky a vztahově.
 
 HTML výstup:
 - Vytvoř samostatný bezpečný HTML blok pro e-mail/newsletter nebo veřejnou odpověď.
 - Používej inline CSS, jednoduchý responzivní layout, bez externích skriptů, bez externích fontů, bez tracking pixelů.
 - HTML musí být vložitelné do Shoptetu, e-mailového nástroje nebo interního náhledu.
-- CTA tlačítko nech jako href="#" nebo {{CTA_URL}}, pokud není URL zadána.
-
-Schvalování:
-- approval_required nastav true pro právní výzvy, advokáty, banky, regulátory, AML, refundace, Gold Deposit, custody, odměny, výnosy, zpožděné dodání kovu, hrozby sporem, negativní recenze s rizikem zveřejnění citlivých údajů a vše s risk_level high/critical.`;
+- CTA tlačítko nech jako href="#" nebo {{CTA_URL}}, pokud není URL zadána.`;
 
 function buildUserPrompt(input: CommunicationGenerateInput) {
   return `=== Režim ===
@@ -106,6 +129,11 @@ Produkt/služba: ${input.product_type || "(neuvedeno)"}
 Typ situace: ${input.situation_type || "(neuvedeno)"}
 Tón: ${input.tone || "lidský, odpovědný, právně opatrný"}
 Riziko: ${input.risk_level}
+Kreativita: ${input.creativity ?? 55}/100
+Formálnost: ${input.formality ?? 35}/100
+Empatie/lidskost: ${input.empathy ?? 75}/100
+Režim majitele: ${input.owner_mode ? "ano – žádné blokace, rizika jen jako doporučení" : "ne"}
+Rizika pouze jako doporučení: ${input.risk_advisory_only ? "ano" : "ne"}
 Jazyk: ${input.language || "cs"}
 
 === Zpráva klienta ===
@@ -144,7 +172,9 @@ ${JSON.stringify(input.desired_output_types, null, 2)}
 === Doplňující instrukce ===
 ${input.extra_instructions || "(žádné)"}
 
-Vygeneruj jen výstupy, které dávají smysl pro zadaný režim. U režimu review vyplň především review_reply a html_output; u režimu client vyplň e-mail, SMS, WhatsApp, telefonní skript, interní poznámku a HTML e-mail.`;
+Vygeneruj jen výstupy, které dávají smysl pro zadaný režim. U režimu review vyplň především review_reply a html_output; u režimu client vyplň e-mail, SMS, WhatsApp, telefonní skript, interní poznámku a HTML e-mail.
+
+Důležité: text nesmí znít uměle. První verze má být prakticky použitelná bez velkého přepisování. Primárně drž klienta, obnov důvěru a chraň značku.`;
 }
 
 function normalizeArray(value: unknown): string[] {
@@ -195,9 +225,9 @@ function escapeHtml(s: string) {
 }
 
 function fallbackResult(input: CommunicationGenerateInput) {
-  const approvalRequired = input.risk_level === "high" || input.risk_level === "critical" || ["gold_deposit", "refund", "legal_notice", "aml", "review_negative"].includes(input.situation_type);
+  const approvalRequired = input.risk_advisory_only !== true && (input.risk_level === "high" || input.risk_level === "critical" || ["gold_deposit", "refund", "legal_notice", "aml", "review_negative"].includes(input.situation_type));
   if (input.mode === "review") {
-    const reviewReply = `Dobrý den, děkujeme za zpětnou vazbu. Mrzí nás, že Vaše zkušenost neodpovídala očekávání. Rádi bychom situaci prověřili konkrétně a férově, proto nás prosím kontaktujte přímo na zákaznické podpoře, abychom mohli dohledat potřebné podklady a navrhnout další postup. Děkujeme.`;
+    const reviewReply = `Dobrý den, děkujeme za zpětnou vazbu. Mrzí mě, že jste měl/a takovou zkušenost. Nechci to odbýt obecnou odpovědí ve veřejné recenzi — napište nám prosím přímo, abychom mohli dohledat konkrétní případ a najít férové řešení. Děkuji.`;
     return {
       mode: "review",
       subject: "Reakce na recenzi",
@@ -213,7 +243,7 @@ function fallbackResult(input: CommunicationGenerateInput) {
       phrases_to_avoid: ["zveřejnění detailů objednávky", "obviňování klienta", "uznání právní odpovědnosti bez ověření"],
       safe_wording: ["situaci prověříme", "kontaktujte nás přímo", "děkujeme za zpětnou vazbu"],
       checklist: ["Dohledat klienta", "Ověřit průběh objednávky", "Zkontrolovat poslední komunikaci", "Schválit před zveřejněním"],
-      recommended_next_steps: ["Veřejně odpovědět stručně", "Detail řešit mimo veřejnou platformu"],
+      recommended_next_steps: ["Veřejně odpovědět stručně a lidsky", "Detail řešit mimo veřejnou platformu", "Kontaktovat klienta aktivně, pokud jej lze dohledat"],
       approval_required: approvalRequired,
       html_notes: ["HTML je fallback šablona bez AI."],
     };
@@ -221,11 +251,11 @@ function fallbackResult(input: CommunicationGenerateInput) {
 
   const email = `Dobrý den${input.client_name ? `, ${input.client_name}` : ""},
 
-omlouvám se, že jste od nás nedostal/a včas jasnou informaci. Komunikace z naší strany v této věci nebyla dostatečná a chápu, že to mohlo vyvolat nejistotu.
+omlouvám se, že jste od nás neměl/a včas jasnou a konkrétní informaci. To není v pořádku a chápu, že to ve Vás mohlo vyvolat nejistotu.
 
-Vaši záležitost nyní prověřujeme podle dostupných podkladů. Nechci Vám dávat neověřený termín ani nepřesnou informaci, proto Vám po ověření zašleme konkrétní stanovisko a další postup.
+Vaši věc teď beru k prověření podle dostupných podkladů. Nechci Vám psát neověřený termín nebo obecnou odpověď, která Vám reálně nepomůže. Jakmile ověřím stav věci, pošlu Vám konkrétní další postup.
 
-Děkuji za trpělivost a omlouvám se za komplikace.`;
+Mým cílem je situaci narovnat a dát Vám jasnou odpověď, ne Vás nechat čekat bez informace.`;
   return {
     mode: "client",
     subject: "Omluva a další postup",
@@ -267,7 +297,7 @@ export async function generateCommunication(input: CommunicationGenerateInput): 
     recommended_next_steps: normalizeArray(result.recommended_next_steps).length ? normalizeArray(result.recommended_next_steps) : fallback.recommended_next_steps,
     html_notes: normalizeArray(result.html_notes),
     html_output: result.html_output || fallbackHtml(result.subject || fallback.subject, body, input.mode === "review" ? "Kontaktovat podporu" : "Kontaktovat nás"),
-    approval_required: Boolean(result.approval_required ?? fallback.approval_required),
+    approval_required: input.risk_advisory_only === true ? false : Boolean(result.approval_required ?? fallback.approval_required),
   };
 }
 

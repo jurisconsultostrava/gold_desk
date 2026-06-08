@@ -48,13 +48,15 @@ const SITUATIONS = [
 ];
 
 const TONES = [
+  ["direct_human", "Přímá lidská odpověď"],
+  ["customer_retention", "Udržet zákazníka"],
   ["human_apology", "Lidská omluva"],
-  ["legally_cautious", "Právně opatrný"],
-  ["crisis", "Krizový"],
-  ["formal", "Formální"],
+  ["crisis", "Krizový, ale ne sterilní"],
   ["vip", "VIP klient"],
   ["short", "Krátká SMS/WhatsApp"],
   ["public_safe", "Veřejně bezpečná recenze"],
+  ["legally_cautious", "Právně opatrný, ale lidský"],
+  ["formal", "Formální"],
 ];
 
 const PRODUCT_TYPES = [
@@ -98,8 +100,13 @@ function initialForm(): CommunicatorInput {
       internal_note: true,
       html: true,
     },
-    tone: "human_apology",
+    tone: "direct_human",
     risk_level: "medium",
+    creativity: 55,
+    formality: 35,
+    empathy: 80,
+    owner_mode: true,
+    risk_advisory_only: true,
     language: "cs",
     extra_instructions: "",
   };
@@ -200,7 +207,7 @@ export default function Communicator() {
       ...f,
       mode,
       situation_type: mode === "review" ? "review_negative" : "delayed_reply",
-      tone: mode === "review" ? "public_safe" : "human_apology",
+      tone: mode === "review" ? "public_safe" : "direct_human",
       risk_level: mode === "review" ? "high" : "medium",
     }));
     setResult(null);
@@ -240,7 +247,7 @@ export default function Communicator() {
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">GoldDesk Communicator</h1>
-            <p className="text-sm text-muted-foreground">Bezpečné odpovědi klientům, HTML e-maily a reakce na recenze.</p>
+            <p className="text-sm text-muted-foreground">Lidské odpovědi klientům, HTML e-maily a reakce na recenze. Primární cíl: udržet zákazníka, obnovit důvěru a ochránit značku.</p>
           </div>
           <div className="flex gap-2">
             <Button variant={form.mode === "client" ? "default" : "outline"} onClick={() => setMode("client")}>
@@ -324,7 +331,7 @@ export default function Communicator() {
           <Card>
             <CardHeader>
               <CardTitle>Zadání</CardTitle>
-              <CardDescription>Čím konkrétnější fakta, tím bezpečnější odpověď. Neověřená data raději napiš do pole „co nevíme“.</CardDescription>
+              <CardDescription>Čím konkrétnější fakta, tím použitelnější odpověď. Výchozí režim je majitelský: lidsky, přímo, se snahou zachránit vztah se zákazníkem.</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="grid grid-cols-2 gap-3">
@@ -365,6 +372,38 @@ export default function Communicator() {
                 </Field>
               </div>
 
+              <div className="space-y-3 rounded-lg border bg-background p-3">
+                <div>
+                  <div className="text-sm font-medium">Styl výstupu</div>
+                  <p className="text-xs text-muted-foreground">Rizika jsou jen poradenské upozornění. Text nemá znít jako korporátní formulář — má držet zákazníka a obnovit důvěru.</p>
+                </div>
+                <RangeControl
+                  label="Kreativita"
+                  value={form.creativity ?? 55}
+                  minLabel="věcně"
+                  maxLabel="osobněji"
+                  onChange={(v) => update("creativity", v as any)}
+                />
+                <RangeControl
+                  label="Formálnost"
+                  value={form.formality ?? 35}
+                  minLabel="civilně"
+                  maxLabel="formálně"
+                  onChange={(v) => update("formality", v as any)}
+                />
+                <RangeControl
+                  label="Lidskost / empatie"
+                  value={form.empathy ?? 80}
+                  minLabel="stručně"
+                  maxLabel="vztahově"
+                  onChange={(v) => update("empathy", v as any)}
+                />
+                <div className="grid gap-2 pt-1 text-sm md:grid-cols-2">
+                  <Toggle label="Režim majitele" checked={form.owner_mode !== false} onChange={(v) => update("owner_mode", v as any)} />
+                  <Toggle label="Rizika jen jako doporučení" checked={form.risk_advisory_only !== false} onChange={(v) => update("risk_advisory_only", v as any)} />
+                </div>
+              </div>
+
               {form.mode === "review" ? (
                 <div className="space-y-3 rounded-lg border bg-muted/30 p-3">
                   <div className="grid grid-cols-2 gap-3">
@@ -401,7 +440,7 @@ export default function Communicator() {
                 <Textarea value={form.what_we_must_not_promise || ""} onChange={(e) => update("what_we_must_not_promise", e.target.value)} rows={2} placeholder="Např. neověřený termín, uznání dluhu, právní závěr..." />
               </Field>
               <Field label="Doplňující instrukce">
-                <Textarea value={form.extra_instructions || ""} onChange={(e) => update("extra_instructions", e.target.value)} rows={2} placeholder="Např. více lidsky, méně formálně, bez konkrétního data..." />
+                <Textarea value={form.extra_instructions || ""} onChange={(e) => update("extra_instructions", e.target.value)} rows={2} placeholder="Např. napiš to přímo, bez korporátní vaty; hlavní cíl je udržet klienta a obnovit důvěru..." />
               </Field>
 
               <div className="grid grid-cols-2 gap-2 rounded-lg border p-3 text-sm">
@@ -448,14 +487,14 @@ export default function Communicator() {
           <div className="grid gap-4 md:grid-cols-3">
             <InfoCard title="Šablony" value={String(templates.data?.length || 0)} description="přednastavené situace" />
             <InfoCard title="Historie" value={String(history.data?.length || 0)} description="uložené výstupy" />
-            <InfoCard title="Režim" value={form.mode === "review" ? "Recenze" : "Klient"} description="aktuální workflow" />
+            <InfoCard title="Cíl" value="Důvěra" description="udržet zákazníka a značku" />
           </div>
 
           {approvalRequired && (
             <Alert variant="destructive">
               <ShieldAlert className="size-4" />
-              <AlertTitle>Vyžaduje schválení</AlertTitle>
-              <AlertDescription>Tento výstup je rizikový. Před odesláním nebo zveřejněním jej musí schválit vedení / právník.</AlertDescription>
+              <AlertTitle>Rizikové upozornění</AlertTitle>
+              <AlertDescription>Výstup obsahuje citlivé body. Nejde o blokaci — ber to jako připomenutí, co před použitím ověřit.</AlertDescription>
             </Alert>
           )}
 
@@ -533,7 +572,7 @@ export default function Communicator() {
           <Card>
             <CardHeader>
               <CardTitle>Knihovna šablon</CardTitle>
-              <CardDescription>Pevné režimy, které pomáhají zaměstnancům držet bezpečnou komunikační linku.</CardDescription>
+              <CardDescription>Pevné režimy pro rychlou odpověď bez umělého tónu. Rizika slouží jako poradenské upozornění, ne jako filtr.</CardDescription>
             </CardHeader>
             <CardContent className="grid gap-3 md:grid-cols-2">
               {(templates.data || []).slice(0, 8).map((t: any) => (
@@ -568,6 +607,29 @@ function Toggle({ label, checked, onChange }: { label: string; checked: boolean;
       <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="size-4 rounded border" />
       <span>{label}</span>
     </label>
+  );
+}
+
+function RangeControl({ label, value, minLabel, maxLabel, onChange }: { label: string; value: number; minLabel: string; maxLabel: string; onChange: (v: number) => void }) {
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-3 text-sm">
+        <span className="font-medium">{label}</span>
+        <Badge variant="outline">{value}/100</Badge>
+      </div>
+      <input
+        type="range"
+        min={0}
+        max={100}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="w-full accent-primary"
+      />
+      <div className="flex justify-between text-[11px] text-muted-foreground">
+        <span>{minLabel}</span>
+        <span>{maxLabel}</span>
+      </div>
+    </div>
   );
 }
 

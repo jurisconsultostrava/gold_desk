@@ -381,25 +381,90 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   const DATOVKA_BUCKET = "datovka-files";
 
+  const DATOVKA_BASE_COLUMNS = "id,user_id,name,id_ds,ico,notes,created_at";
+  const DATOVKA_LIVE_COLUMNS = "id,user_id,name,id_ds,ico,notes,live_access_enabled,is_test,sync_days,sync_limit,sync_status,sync_error,last_sync_at,password_expires_at,live_info,created_at";
+
   function datovkaPublicColumns() {
-    return "id,user_id,name,id_ds,ico,notes,live_access_enabled,is_test,sync_days,sync_limit,sync_status,sync_error,last_sync_at,password_expires_at,live_info,created_at";
+    return DATOVKA_LIVE_COLUMNS;
   }
 
-  function datovkaMailboxPatch(parsed: any, existing?: any): Record<string, any> {
+  function isDatovkaLiveSchemaMissing(error: any) {
+    const msg = String(error?.message || error?.details || error?.hint || "").toLowerCase();
+    return error?.code === "42703"
+      || error?.code === "PGRST204"
+      || msg.includes("live_access_enabled")
+      || msg.includes("login_enc")
+      || msg.includes("password_enc")
+      || msg.includes("password_expires_at")
+      || msg.includes("schema cache")
+      || msg.includes("could not find the");
+  }
+
+  function normalizeDatovkaMailbox(row: any, liveSchemaReady = true) {
+    return {
+      ...row,
+      live_access_enabled: row?.live_access_enabled ?? false,
+      is_test: row?.is_test ?? false,
+      sync_days: row?.sync_days ?? 90,
+      sync_limit: row?.sync_limit ?? 100,
+      sync_status: row?.sync_status ?? "idle",
+      sync_error: row?.sync_error ?? (liveSchemaReady ? null : "Databáze ještě nemá live ISDS sloupce. Spusť migration_databox_live.sql v Supabase."),
+      last_sync_at: row?.last_sync_at ?? null,
+      password_expires_at: row?.password_expires_at ?? null,
+      live_info: row?.live_info ?? {},
+      schema_warning: liveSchemaReady ? null : "missing_databox_live_migration",
+    };
+  }
+
+  function datovkaMailboxPatch(parsed: any, existing?: any, includeLiveColumns = true): Record<string, any> {
     const patch: Record<string, any> = {};
-    for (const k of ["name", "id_ds", "ico", "notes", "live_access_enabled", "is_test", "sync_days", "sync_limit"]) {
+    for (const k of ["name", "id_ds", "ico", "notes"]) {
       if (parsed[k] !== undefined) patch[k] = parsed[k];
     }
-    if (parsed.login !== undefined && String(parsed.login || "").trim()) {
-      patch.login_enc = encrypt(String(parsed.login).trim());
-      patch.live_access_enabled = parsed.live_access_enabled ?? true;
+    if (includeLiveColumns) {
+      for (const k of ["live_access_enabled", "is_test", "sync_days", "sync_limit"]) {
+        if (parsed[k] !== undefined) patch[k] = parsed[k];
+      }
+      if (parsed.login !== undefined && String(parsed.login || "").trim()) {
+        patch.login_enc = encrypt(String(parsed.login).trim());
+        patch.live_access_enabled = parsed.live_access_enabled ?? true;
+      }
+      if (parsed.password !== undefined && String(parsed.password || "")) {
+        patch.password_enc = encrypt(String(parsed.password));
+        patch.live_access_enabled = parsed.live_access_enabled ?? true;
+      }
+      if (!existing && patch.live_access_enabled === undefined) patch.live_access_enabled = false;
     }
-    if (parsed.password !== undefined && String(parsed.password || "")) {
-      patch.password_enc = encrypt(String(parsed.password));
-      patch.live_access_enabled = parsed.live_access_enabled ?? true;
-    }
-    if (!existing && patch.live_access_enabled === undefined) patch.live_access_enabled = false;
     return patch;
+  }
+
+  function wantsLiveDatovkaFields(parsed: any) {
+    return parsed.live_access_enabled === true
+      || parsed.login !== undefined
+      || parsed.password !== undefined
+      || parsed.is_test !== undefined
+      || parsed.sync_days !== undefined
+      || parsed.sync_limit !== undefined;
+  }
+
+  function datovkaMigrationRequired(res: Response) {
+    return res.status(428).json({
+      message: "Databáze ještě nemá sloupce pro online ISDS přístup. V Supabase spusť migration_databox_live.sql nebo celý aktuální migration.sql.",
+      code: "DATABOX_LIVE_MIGRATION_REQUIRED",
+      sql: `alter table public.datovka_mailboxes
+  add column if not exists login_enc text,
+  add column if not exists password_enc text,
+  add column if not exists live_access_enabled boolean default false,
+  add column if not exists is_test boolean default false,
+  add column if not exists sync_days int default 90,
+  add column if not exists sync_limit int default 100,
+  add column if not exists sync_status text default 'idle',
+  add column if not exists sync_error text,
+  add column if not exists last_sync_at timestamptz,
+  add column if not exists password_expires_at timestamptz,
+  add column if not exists live_info jsonb default '{}'::jsonb;
+create index if not exists idx_datovka_mailboxes_live on public.datovka_mailboxes(user_id, live_access_enabled);`
+    });
   }
 
   // GET /api/datovka/mailboxes
@@ -411,41 +476,84 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       .select(datovkaPublicColumns())
       .eq("user_id", config.userId)
       .order("created_at", { ascending: true });
-    if (error) throw error;
-    res.json(data || []);
+    if (!error) return res.json((data || []).map((row) => normalizeDatovkaMailbox(row, true)));
+
+    // Starší databáze bez live ISDS sloupců nesmí shodit celou stránku Datovky.
+    if (isDatovkaLiveSchemaMissing(error)) {
+      const fallback = await sb
+        .from("datovka_mailboxes")
+        .select(DATOVKA_BASE_COLUMNS)
+        .eq("user_id", config.userId)
+        .order("created_at", { ascending: true });
+      if (fallback.error) throw fallback.error;
+      return res.json((fallback.data || []).map((row) => normalizeDatovkaMailbox(row, false)));
+    }
+    throw error;
   }));
 
   // POST /api/datovka/mailboxes
   app.post("/api/datovka/mailboxes", asyncH(async (req, res) => {
     requireSupabase();
-    requireEnc();
     const parsed = insertDatovkaMailboxSchema.parse(req.body);
     const sb = supabase()!;
+
+    if (wantsLiveDatovkaFields(parsed)) requireEnc();
+
     const insert = { ...datovkaMailboxPatch(parsed), user_id: config.userId };
     const { data, error } = await sb
       .from("datovka_mailboxes")
       .insert(insert)
       .select(datovkaPublicColumns())
       .single();
-    if (error) throw error;
-    res.status(201).json(data);
+    if (!error) return res.status(201).json(normalizeDatovkaMailbox(data, true));
+
+    if (isDatovkaLiveSchemaMissing(error)) {
+      if (wantsLiveDatovkaFields(parsed)) return datovkaMigrationRequired(res);
+      const fallbackInsert = { ...datovkaMailboxPatch(parsed, undefined, false), user_id: config.userId };
+      const fallback = await sb
+        .from("datovka_mailboxes")
+        .insert(fallbackInsert)
+        .select(DATOVKA_BASE_COLUMNS)
+        .single();
+      if (fallback.error) throw fallback.error;
+      return res.status(201).json(normalizeDatovkaMailbox(fallback.data, false));
+    }
+    throw error;
   }));
 
   // PATCH /api/datovka/mailboxes/:id
   app.patch("/api/datovka/mailboxes/:id", asyncH(async (req, res) => {
     requireSupabase();
-    requireEnc();
     const sb = supabase()!;
     const id = String(req.params.id);
     const parsed = insertDatovkaMailboxSchema.partial().parse(req.body);
-    const { data: existing, error: fetchErr } = await sb
+
+    if (wantsLiveDatovkaFields(parsed)) requireEnc();
+
+    let existing: any = null;
+    const existingFull = await sb
       .from("datovka_mailboxes")
       .select("*")
       .eq("id", id)
       .eq("user_id", config.userId)
       .single();
-    if (fetchErr || !existing) return res.status(404).json({ message: "Datová schránka nenalezena" });
-    const patch = datovkaMailboxPatch(parsed, existing);
+
+    if (existingFull.error && isDatovkaLiveSchemaMissing(existingFull.error)) {
+      const existingBase = await sb
+        .from("datovka_mailboxes")
+        .select(DATOVKA_BASE_COLUMNS)
+        .eq("id", id)
+        .eq("user_id", config.userId)
+        .single();
+      if (existingBase.error || !existingBase.data) return res.status(404).json({ message: "Datová schránka nenalezena" });
+      existing = existingBase.data;
+    } else if (existingFull.error || !existingFull.data) {
+      return res.status(404).json({ message: "Datová schránka nenalezena" });
+    } else {
+      existing = existingFull.data;
+    }
+
+    const patch = datovkaMailboxPatch(parsed, existing, true);
     const { data, error } = await sb
       .from("datovka_mailboxes")
       .update(patch)
@@ -453,8 +561,22 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       .eq("user_id", config.userId)
       .select(datovkaPublicColumns())
       .single();
-    if (error) throw error;
-    res.json(data);
+    if (!error) return res.json(normalizeDatovkaMailbox(data, true));
+
+    if (isDatovkaLiveSchemaMissing(error)) {
+      if (wantsLiveDatovkaFields(parsed)) return datovkaMigrationRequired(res);
+      const fallbackPatch = datovkaMailboxPatch(parsed, existing, false);
+      const fallback = await sb
+        .from("datovka_mailboxes")
+        .update(fallbackPatch)
+        .eq("id", id)
+        .eq("user_id", config.userId)
+        .select(DATOVKA_BASE_COLUMNS)
+        .single();
+      if (fallback.error) throw fallback.error;
+      return res.json(normalizeDatovkaMailbox(fallback.data, false));
+    }
+    throw error;
   }));
 
   // POST /api/datovka/mailboxes/:id/test-live
@@ -470,6 +592,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       .eq("user_id", config.userId)
       .single();
     if (error || !mailbox) return res.status(404).json({ message: "Datová schránka nenalezena" });
+    if (!("login_enc" in mailbox) || !("password_enc" in mailbox)) {
+      return datovkaMigrationRequired(res);
+    }
     if (!mailbox.login_enc || !mailbox.password_enc) {
       return res.status(400).json({ message: "Nejdřív ulož login a heslo k ISDS." });
     }
@@ -492,6 +617,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     requireSupabase();
     requireEnc();
     const id = String(req.params.id);
+    const sb = supabase()!;
+    const schemaCheck = await sb
+      .from("datovka_mailboxes")
+      .select("login_enc,password_enc,live_access_enabled,sync_days,sync_limit")
+      .eq("id", id)
+      .eq("user_id", config.userId)
+      .single();
+    if (schemaCheck.error) {
+      if (isDatovkaLiveSchemaMissing(schemaCheck.error)) return datovkaMigrationRequired(res);
+      return res.status(404).json({ message: "Datová schránka nenalezena" });
+    }
     const days = req.body?.days ? Number(req.body.days) : undefined;
     const limit = req.body?.limit ? Number(req.body.limit) : undefined;
     // For small manual syncs we return the result directly. Railway can run this request safely for common 10-100 message windows.

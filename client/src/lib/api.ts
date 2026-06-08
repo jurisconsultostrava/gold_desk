@@ -75,6 +75,11 @@ export interface CommunicatorInput {
   };
   tone?: string;
   risk_level?: "low" | "medium" | "high" | "critical";
+  creativity?: number;
+  formality?: number;
+  empathy?: number;
+  owner_mode?: boolean;
+  risk_advisory_only?: boolean;
   language?: string;
   extra_instructions?: string;
   provider?: string;
